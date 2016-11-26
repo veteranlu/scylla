@@ -70,7 +70,6 @@
 #include "utils/estimated_histogram.hh"
 #include "sstables/compaction.hh"
 #include "sstables/sstable_set.hh"
-#include "key_reader.hh"
 #include <seastar/core/rwlock.hh>
 #include <seastar/core/shared_future.hh>
 #include "tracing/trace_state.hh"
@@ -120,28 +119,59 @@ class dirty_memory_manager: public logalloc::region_group_reclaimer {
     // throttled for a long time. Even when we have virtual dirty, that only provides a rough
     // estimate, and we can't release requests that early.
     semaphore _flush_serializer;
+    // We will accept a new flush before another one ends, once it is done with the data write.
+    // That is so we can keep the disk always busy. But there is still some background work that is
+    // left to be done. Mostly, update the caches and seal the auxiliary components of the SSTable.
+    // This semaphore will cap the amount of background work that we have. Note that we're not
+    // overly concerned about memtable memory, because dirty memory will put a limit to that. This
+    // is mostly about dangling continuations. So that doesn't have to be a small number.
+    static constexpr unsigned _max_background_work = 20;
+    semaphore _background_work_flush_serializer = { _max_background_work };
+    condition_variable _should_flush;
     int64_t _dirty_bytes_released_pre_accounted = 0;
 
-    seastar::gate _waiting_flush_gate;
-    std::vector<shared_memtable> _pending_flushes;
-    void maybe_do_active_flush();
+    future<> flush_when_needed();
+    // We need to start a flush before the current one finishes, otherwise
+    // we'll have a period without significant disk activity when the current
+    // SSTable is being sealed, the caches are being updated, etc. To do that
+    // we need to keep track of who is it that we are flushing this memory from.
+    struct flush_token {
+        dirty_memory_manager* _dirty_memory_manager;
+        size_t _freed_memory = 0;
+        semaphore_units<> _sem;
+    public:
+        flush_token(dirty_memory_manager *dm, semaphore_units<>&& s) : _dirty_memory_manager(dm), _sem(std::move(s)) {}
+        void mark_end_flush(size_t freed) {
+            auto destroy = std::move(_sem);
+            _freed_memory = freed;
+        }
+        ~flush_token() {
+            _dirty_memory_manager->_region_group.update(_freed_memory);
+            _dirty_memory_manager->_dirty_bytes_released_pre_accounted -= _freed_memory;
+        }
+    };
+    friend class flush_token;
+    std::unordered_map<const logalloc::region*, flush_token> _flush_manager;
+
+    future<> _waiting_flush;
 protected:
-    virtual memtable_list& get_memtable_list(column_family& cf) = 0;
     virtual void start_reclaiming() override;
 public:
     future<> shutdown();
 
     dirty_memory_manager(database* db, size_t threshold)
-                                           : logalloc::region_group_reclaimer(threshold)
+                                           : logalloc::region_group_reclaimer(threshold, threshold * 0.4)
                                            , _db(db)
                                            , _region_group(*this)
-                                           , _flush_serializer(1) {}
+                                           , _flush_serializer(1)
+                                           , _waiting_flush(flush_when_needed()) {}
 
     dirty_memory_manager(database* db, dirty_memory_manager *parent, size_t threshold)
-                                                                         : logalloc::region_group_reclaimer(threshold)
+                                                                         : logalloc::region_group_reclaimer(threshold, threshold * 0.4)
                                                                          , _db(db)
                                                                          , _region_group(&parent->_region_group, *this)
-                                                                         , _flush_serializer(1) {}
+                                                                         , _flush_serializer(1)
+                                                                         , _waiting_flush(flush_when_needed()) {}
 
     static dirty_memory_manager& from_region_group(logalloc::region_group *rg) {
         return *(boost::intrusive::get_parent_from_member(rg, &dirty_memory_manager::_region_group));
@@ -155,14 +185,42 @@ public:
         return _region_group;
     }
 
-    void revert_potentially_cleaned_up_memory(int64_t delta) {
-        _region_group.update(delta);
-        _dirty_bytes_released_pre_accounted -= delta;
+    void revert_potentially_cleaned_up_memory(logalloc::region* from, int64_t delta) {
+        // Flushed the current memtable. There is still some work to do, like finish sealing the
+        // SSTable and updating the cache, but we can already allow the next one to start.
+        //
+        // By erasing this memtable from the flush_manager we'll destroy the semaphore_units
+        // associated with this flush and will allow another one to start. We'll signal the
+        // condition variable to let them know we might be ready early.
+        auto it = _flush_manager.find(from);
+        if (it != _flush_manager.end()) {
+            it->second.mark_end_flush(delta);
+        }
     }
 
-    void account_potentially_cleaned_up_memory(int64_t delta) {
+    void account_potentially_cleaned_up_memory(logalloc::region* from, int64_t delta) {
         _region_group.update(-delta);
         _dirty_bytes_released_pre_accounted += delta;
+    }
+
+    // This can be called multiple times during the lifetime of the region, and should always
+    // ultimately be called after the flush ends. However, some flushers may decide to call it
+    // earlier. For instance, the normal memtables sealing function will call this before updating
+    // the cache.
+    //
+    // Also, for sealing methods like the normal memtable sealing method - that may retry after a
+    // failed write, calling this method after the attempt is completed with success or failure is
+    // mandatory. That's because the new attempt will create a new flush reader for the same
+    // SSTable, so we need to make sure that we revert the old charges.
+    void remove_from_flush_manager(const logalloc::region *region) {
+        auto it = _flush_manager.find(region);
+        if (it != _flush_manager.end()) {
+            _flush_manager.erase(it);
+        }
+    }
+
+    void add_to_flush_manager(const logalloc::region *region, semaphore_units<>&& permit) {
+        _flush_manager.emplace(std::piecewise_construct, std::make_tuple(region), std::make_tuple(this, std::move(permit)));
     }
 
     size_t real_dirty_memory() const {
@@ -173,25 +231,18 @@ public:
         return _region_group.memory_used();
     }
 
-    template <typename Func>
-    future<> serialize_flush(Func&& func) {
-        return seastar::with_gate(_waiting_flush_gate,  [this, func] () mutable {
-            return with_semaphore(_flush_serializer, 1, func).finally([this] {
-                maybe_do_active_flush();
-            });
-        });
+    future<> flush_one(memtable_list& cf, semaphore_units<> permit);
+
+    future<semaphore_units<>> get_flush_permit() {
+        return get_units(_flush_serializer, 1);
     }
 };
 
-class streaming_dirty_memory_manager: public dirty_memory_manager {
-    virtual memtable_list& get_memtable_list(column_family& cf) override;
-public:
+struct streaming_dirty_memory_manager: public dirty_memory_manager {
     streaming_dirty_memory_manager(database& db, dirty_memory_manager *parent, size_t threshold) : dirty_memory_manager(&db, parent, threshold) {}
 };
 
-class memtable_dirty_memory_manager: public dirty_memory_manager {
-    virtual memtable_list& get_memtable_list(column_family& cf) override;
-public:
+struct memtable_dirty_memory_manager: public dirty_memory_manager {
     memtable_dirty_memory_manager(database& db, dirty_memory_manager* parent, size_t threshold) : dirty_memory_manager(&db, parent, threshold) {}
     // This constructor will be called for the system tables (no parent). Its flushes are usually drive by us
     // and not the user, and tend to be small in size. So we'll allow only two slots.
@@ -226,14 +277,13 @@ private:
     std::vector<shared_memtable> _memtables;
     std::function<future<> (flush_behavior)> _seal_fn;
     std::function<schema_ptr()> _current_schema;
-    size_t _max_memtable_size;
     dirty_memory_manager* _dirty_memory_manager;
+    std::experimental::optional<shared_promise<>> _flush_coalescing;
 public:
-    memtable_list(std::function<future<> (flush_behavior)> seal_fn, std::function<schema_ptr()> cs, size_t max_memtable_size, dirty_memory_manager* dirty_memory_manager)
+    memtable_list(std::function<future<> (flush_behavior)> seal_fn, std::function<schema_ptr()> cs, dirty_memory_manager* dirty_memory_manager)
         : _memtables({})
         , _seal_fn(seal_fn)
         , _current_schema(cs)
-        , _max_memtable_size(max_memtable_size)
         , _dirty_memory_manager(dirty_memory_manager) {
         add_memtable();
     }
@@ -282,20 +332,17 @@ public:
         _memtables.emplace_back(new_memtable());
     }
 
-    bool should_flush() {
-        return active_memtable().occupancy().total_space() >= _max_memtable_size;
+    logalloc::region_group& region_group() {
+        return _dirty_memory_manager->region_group();
     }
-
-    void seal_on_overflow() {
-        if (should_flush()) {
-            // FIXME: if sparse, do some in-memory compaction first
-            // FIXME: maybe merge with other in-memory memtables
-            seal_active_memtable(flush_behavior::immediate);
-        }
-    }
+    // This is used for explicit flushes. Will queue the memtable for flushing and proceed when the
+    // dirty_memory_manager allows us to. We will not seal at this time since the flush itself
+    // wouldn't happen anyway. Keeping the memtable in memory will potentially increase the time it
+    // spends in memory allowing for more coalescing opportunities.
+    future<> request_flush();
 private:
     lw_shared_ptr<memtable> new_memtable() {
-        return make_lw_shared<memtable>(_current_schema(), &(_dirty_memory_manager->region_group()));
+        return make_lw_shared<memtable>(_current_schema(), this);
     }
 };
 
@@ -329,8 +376,6 @@ public:
         bool enable_cache = true;
         bool enable_commitlog = true;
         bool enable_incremental_backups = false;
-        size_t max_memtable_size = 5'000'000;
-        size_t max_streaming_memtable_size = 5'000'000;
         ::dirty_memory_manager* dirty_memory_manager = &default_dirty_memory_manager;
         ::dirty_memory_manager* streaming_dirty_memory_manager = &default_dirty_memory_manager;
         restricted_mutation_reader_config read_concurrency_config;
@@ -492,7 +537,6 @@ private:
                                         tracing::trace_state_ptr trace_state) const;
 
     mutation_source sstables_as_mutation_source();
-    key_source sstables_as_key_source() const;
     partition_presence_checker make_partition_presence_checker(sstables::shared_sstable exclude_sstable);
     std::chrono::steady_clock::time_point _sstable_writes_disabled_at;
     void do_trigger_compaction();
@@ -884,8 +928,6 @@ public:
         bool enable_disk_writes = true;
         bool enable_cache = true;
         bool enable_incremental_backups = false;
-        size_t max_memtable_size = 5'000'000;
-        size_t max_streaming_memtable_size = 5'000'000;
         ::dirty_memory_manager* dirty_memory_manager = &default_dirty_memory_manager;
         ::dirty_memory_manager* streaming_dirty_memory_manager = &default_dirty_memory_manager;
         restricted_mutation_reader_config read_concurrency_config;

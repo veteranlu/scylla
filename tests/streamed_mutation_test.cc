@@ -19,7 +19,6 @@
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#define BOOST_TEST_DYN_LINK
 
 #include <seastar/core/thread.hh>
 #include <seastar/tests/test-utils.hh>
@@ -42,9 +41,9 @@ void check_order_of_fragments(streamed_mutation sm)
     auto mf = sm().get0();
     while (mf) {
         if (previous) {
-            BOOST_REQUIRE(cmp(*previous, *mf));
+            BOOST_REQUIRE(cmp(*previous, mf->position()));
         }
-        previous = mf->position();
+        previous = position_in_partition(mf->position());
         mf = sm().get0();
     }
 }

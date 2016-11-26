@@ -19,7 +19,6 @@
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#define BOOST_TEST_DYN_LINK
 #define BOOST_TEST_MODULE core
 
 #include <boost/test/unit_test.hpp>
@@ -42,6 +41,12 @@ static dht::token token_from_long(uint64_t value) {
     bytes b(bytes::initialized_later(), 8);
     std::copy_n(reinterpret_cast<int8_t*>(&t), 8, b.begin());
     return { dht::token::kind::key, std::move(b) };
+}
+
+static int64_t long_from_token(dht::token token) {
+    int64_t data;
+    std::copy_n(token._data.data(), 8, reinterpret_cast<char*>(&data));
+    return net::ntoh(data);
 }
 
 BOOST_AUTO_TEST_CASE(test_decorated_key_is_compatible_with_origin) {
@@ -464,3 +469,154 @@ BOOST_AUTO_TEST_CASE(test_rp_describe_ownership) {
     BOOST_REQUIRE(std::fabs(own_map[t4] - 0.4) <= FLT_EPSILON);
     dht::set_global_partitioner(to_sstring("org.apache.cassandra.dht.Murmur3Partitioner"));
 }
+
+void test_partitioner_sharding(const dht::i_partitioner& part, unsigned shards, std::vector<dht::token> shard_limits,
+        std::function<dht::token (const dht::i_partitioner&, dht::token)> prev_token, unsigned ignorebits = 0) {
+    auto s = schema_builder("ks", "cf")
+        .with_column("c1", int32_type, column_kind::partition_key)
+        .with_column("c2", int32_type, column_kind::partition_key)
+        .with_column("v", int32_type)
+        .build();
+    for (unsigned i = 0; i < (shards << ignorebits); ++i) {
+        auto lim = shard_limits[i];
+        BOOST_REQUIRE_EQUAL(part.shard_of(lim), i % shards);
+        if (i != 0) {
+            BOOST_REQUIRE_EQUAL(part.shard_of(prev_token(part, lim)), (i - 1) % shards);
+            BOOST_REQUIRE(part.is_equal(lim, part.token_for_next_shard(prev_token(part, lim))));
+        }
+        if (i != (shards << ignorebits) - 1) {
+            BOOST_REQUIRE_EQUAL(part.shard_of(part.token_for_next_shard(lim)), (i + 1) % shards);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_murmur3_sharding) {
+    auto prev_token = [] (const dht::i_partitioner&, dht::token token) {
+        return token_from_long(long_from_token(token) - 1);
+    };
+    auto make_token_vector = [] (std::vector<int64_t> v) {
+        return boost::copy_range<std::vector<dht::token>>(
+                v | boost::adaptors::transformed(token_from_long));
+    };
+    dht::murmur3_partitioner mm3p7s(7);
+    auto mm3p7s_shard_limits = make_token_vector({
+        -9223372036854775807, -6588122883467697006+1, -3952873730080618204+1,
+        -1317624576693539402+1, 1317624576693539401+1, 3952873730080618203+1,
+        6588122883467697005+1,
+    });
+    test_partitioner_sharding(mm3p7s, 7, mm3p7s_shard_limits, prev_token);
+    dht::murmur3_partitioner mm3p2s(2);
+    auto mm3p2s_shard_limits = make_token_vector({
+        -9223372036854775807, 0,
+    });
+    test_partitioner_sharding(mm3p2s, 2, mm3p2s_shard_limits, prev_token);
+    dht::murmur3_partitioner mm3p1s(1);
+    auto mm3p1s_shard_limits = make_token_vector({
+        -9223372036854775807,
+    });
+    test_partitioner_sharding(mm3p1s, 1, mm3p1s_shard_limits, prev_token);
+}
+
+BOOST_AUTO_TEST_CASE(test_murmur3_sharding_with_ignorebits) {
+    auto prev_token = [] (const dht::i_partitioner&, dht::token token) {
+        return token_from_long(long_from_token(token) - 1);
+    };
+    auto make_token_vector = [] (std::vector<int64_t> v) {
+        return boost::copy_range<std::vector<dht::token>>(
+                v | boost::adaptors::transformed(token_from_long));
+    };
+    dht::murmur3_partitioner mm3p7s2i(7, 2);
+    auto mm3p7s2i_shard_limits = make_token_vector({
+        -9223372036854775807,
+        -8564559748508006107, -7905747460161236406, -7246935171814466706, -6588122883467697005,
+        -5929310595120927305, -5270498306774157604, -4611686018427387904, -3952873730080618203,
+        -3294061441733848502, -2635249153387078802, -1976436865040309101, -1317624576693539401,
+        -658812288346769700, 0, 658812288346769701, 1317624576693539402, 1976436865040309102,
+        2635249153387078803, 3294061441733848503, 3952873730080618204, 4611686018427387904,
+        5270498306774157605, 5929310595120927306, 6588122883467697006, 7246935171814466707,
+        7905747460161236407, 8564559748508006108,
+    });
+    test_partitioner_sharding(mm3p7s2i, 7, mm3p7s2i_shard_limits, prev_token, 2);
+    dht::murmur3_partitioner mm3p2s4i(2, 4);
+    auto mm3p2s_shard_limits = make_token_vector({
+        -9223372036854775807,
+        -8646911284551352320, -8070450532247928832, -7493989779944505344, -6917529027641081856,
+        -6341068275337658368, -5764607523034234880, -5188146770730811392, -4611686018427387904,
+        -4035225266123964416, -3458764513820540928, -2882303761517117440, -2305843009213693952,
+        -1729382256910270464, -1152921504606846976, -576460752303423488, 0, 576460752303423488,
+        1152921504606846976, 1729382256910270464, 2305843009213693952, 2882303761517117440,
+        3458764513820540928, 4035225266123964416, 4611686018427387904, 5188146770730811392,
+        5764607523034234880, 6341068275337658368, 6917529027641081856, 7493989779944505344,
+        8070450532247928832, 8646911284551352320,
+    });
+    test_partitioner_sharding(mm3p2s4i, 2, mm3p2s_shard_limits, prev_token, 4);
+}
+
+BOOST_AUTO_TEST_CASE(test_random_partitioner) {
+    using int128 = boost::multiprecision::int128_t;
+    auto prev_token = [] (const dht::i_partitioner& part, dht::token token) {
+        return part.from_sstring(std::string(int128(std::string(part.to_sstring(token))) - 1));
+    };
+    auto make_token_vector = [] (dht::i_partitioner& part, std::vector<const char*> v) {
+        auto from_string = [&] (const char* s) { return part.from_sstring(s); };
+        return boost::copy_range<std::vector<dht::token>>(
+                v | boost::adaptors::transformed(from_string));
+    };
+    dht::random_partitioner rp7s(7);
+    auto rp7s_shard_limits = make_token_vector(rp7s, {
+        "0",
+        "24305883351495604533098186245126300819",
+        "48611766702991209066196372490252601637",
+        "72917650054486813599294558735378902455",
+        "97223533405982418132392744980505203274",
+        "121529416757478022665490931225631504092",
+        "145835300108973627198589117470757804910",
+    });
+    test_partitioner_sharding(rp7s, 7, rp7s_shard_limits, prev_token);
+    dht::random_partitioner rp2s(2);
+    auto rp2s_shard_limits = make_token_vector(rp2s, {
+        "0", "85070591730234615865843651857942052864",
+    });
+    test_partitioner_sharding(rp2s, 2, rp2s_shard_limits, prev_token);
+    dht::random_partitioner rp1s(1);
+    auto rp1s_shard_limits = make_token_vector(rp1s, {
+        "0",
+    });
+    test_partitioner_sharding(rp1s, 1, rp1s_shard_limits, prev_token);
+}
+
+BOOST_AUTO_TEST_CASE(test_byte_ordered_partitioner) {
+    auto prev_token = [] (const dht::i_partitioner& part, dht::token token) {
+        auto& bytes = token._data;
+        for (auto i = 0u; i < bytes.size(); ++i) {
+            auto& b = bytes[bytes.size() - 1 - i];
+            auto bfore = b;
+            --b;
+            if (bfore != 0) {
+                break;
+            }
+        }
+        return token;
+    };
+    auto make_token_vector = [] (dht::i_partitioner& part, std::vector<int> v) {
+        auto from_byte = [&] (bytes::value_type b) { return dht::token(dht::token::kind::key, managed_bytes({b})); };
+        return boost::copy_range<std::vector<dht::token>>(
+                v | boost::adaptors::transformed(from_byte));
+    };
+    dht::byte_ordered_partitioner bop7s(7);
+    auto bop7s_shard_limits = make_token_vector(bop7s, {
+        0, 37, 74, 110, 147, 183, 220,
+    });
+    test_partitioner_sharding(bop7s, 7, bop7s_shard_limits, prev_token);
+    dht::byte_ordered_partitioner bop2s(2);
+    auto bop2s_shard_limits = make_token_vector(bop2s, {
+        0, 128,
+    });
+    test_partitioner_sharding(bop2s, 2, bop2s_shard_limits, prev_token);
+    dht::byte_ordered_partitioner bop1s(1);
+    auto bop1s_shard_limits = make_token_vector(bop1s, {
+        0,
+    });
+    test_partitioner_sharding(bop1s, 1, bop1s_shard_limits, prev_token);
+}
+

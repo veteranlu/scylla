@@ -19,7 +19,6 @@
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#define BOOST_TEST_DYN_LINK
 
 #include <boost/test/unit_test.hpp>
 
@@ -194,6 +193,10 @@ SEASTAR_TEST_CASE(missing_summary_query_fail) {
 
 SEASTAR_TEST_CASE(missing_summary_query_negative_fail) {
     return summary_query_fail<-2, 0, 5>(uncompressed_schema(), "tests/sstables/uncompressed", 2);
+}
+
+SEASTAR_TEST_CASE(missing_summary_interval_1_query_ok) {
+    return summary_query<1, 19, 6>(uncompressed_schema(1), "tests/sstables/uncompressed", 2);
 }
 
 SEASTAR_TEST_CASE(missing_summary_first_last_sane) {
@@ -423,6 +426,7 @@ public:
     virtual const io_priority_class& io_priority() override {
         return default_priority_class();
     }
+    virtual void reset() override { }
 };
 
 SEASTAR_TEST_CASE(uncompressed_row_read_at_once) {
@@ -526,6 +530,7 @@ public:
     virtual const io_priority_class& io_priority() override {
         return default_priority_class();
     }
+    virtual void reset() override { }
 };
 
 

@@ -253,8 +253,8 @@ inline schema_ptr list_schema() {
     return s;
 }
 
-inline schema_ptr uncompressed_schema() {
-    static thread_local auto uncompressed = [] {
+inline schema_ptr uncompressed_schema(int32_t min_index_interval = 0) {
+    auto uncompressed = [=] {
         schema_builder builder(make_lw_shared(schema(generate_legacy_id("ks", "uncompressed"), "ks", "uncompressed",
         // partition key
         {{"name", utf8_type}},
@@ -269,6 +269,10 @@ inline schema_ptr uncompressed_schema() {
         // comment
         "Uncompressed data"
        )));
+       builder.set_compressor_params(compression_parameters({ }));
+       if (min_index_interval) {
+           builder.set_min_index_interval(min_index_interval);
+       }
        return builder.build(schema_builder::compact_storage::no);
     }();
     return uncompressed;
@@ -599,6 +603,9 @@ public:
             : _sst(std::move(sst)), _rd(std::move(rd)) {}
     virtual future<streamed_mutation_opt> operator()() override {
         return _rd.read();
+    }
+    virtual future<> fast_forward_to(const query::partition_range& pr) override {
+        return _rd.fast_forward_to(pr);
     }
 };
 

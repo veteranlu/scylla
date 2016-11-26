@@ -184,8 +184,8 @@ public:
                         throw;
                     }
                 });
-            } catch (std::system_error& e) {
-                startlog.error("Directory '{}' not found. Tried to created it but failed: {}", path, e.what());
+            } catch (...) {
+                startlog.error("Directory '{}' cannot be initialized. Tried to do it but failed with: {}", path, std::current_exception());
                 throw;
             }
         });
@@ -281,6 +281,7 @@ verify_seastar_io_scheduler(bool has_max_io_requests, bool developer_mode) {
 }
 
 int main(int ac, char** av) {
+  int return_value = 0;
   try {
     // early check to avoid triggering
     if (!cpu_sanity()) {
@@ -339,12 +340,12 @@ int main(int ac, char** av) {
 
         tcp_syncookies_sanity();
 
-        return seastar::async([cfg, &db, &qp, &proxy, &mm, &ctx, &opts, &dirs, &pctx, &prometheus_server] {
+        return seastar::async([cfg, &db, &qp, &proxy, &mm, &ctx, &opts, &dirs, &pctx, &prometheus_server, &return_value] {
             read_config(opts, *cfg).get();
             apply_logger_settings(cfg->default_log_level(), cfg->logger_log_level(),
                     cfg->log_to_stdout(), cfg->log_to_syslog());
             verify_rlimit(cfg->developer_mode());
-            dht::set_global_partitioner(cfg->partitioner());
+            dht::set_global_partitioner(cfg->partitioner(), cfg->murmur3_partitioner_ignore_msb_bits());
             auto start_thrift = cfg->start_rpc();
             uint16_t api_port = cfg->api_port();
             ctx.api_dir = cfg->api_ui_dir();
@@ -426,7 +427,7 @@ int main(int ac, char** av) {
             supervisor_notify("starting per-shard database core");
             // Note: changed from using a move here, because we want the config object intact.
             db.start(std::ref(*cfg)).get();
-            engine().at_exit([&db] {
+            engine().at_exit([&db, &return_value] {
                 // A shared sstable must be compacted by all shards before it can be deleted.
                 // Since we're stoping, that's not going to happen.  Cancel those pending
                 // deletions to let anyone waiting on them to continue.
@@ -438,8 +439,8 @@ int main(int ac, char** av) {
                     return db.stop();
                 }).then([] {
                         return sstables::await_background_jobs_on_all_shards();
-                }).then([] {
-                        ::_exit(0);
+                }).then([&return_value] {
+                        ::_exit(return_value);
                 });
             });
             verify_seastar_io_scheduler(opts.count("max-io-requests"), db.local().get_config().developer_mode()).get();
@@ -584,7 +585,7 @@ int main(int ac, char** av) {
             api::set_server_stream_manager(ctx).get();
             // Start handling REPAIR_CHECKSUM_RANGE messages
             net::get_messaging_service().invoke_on_all([&db] (auto& ms) {
-                ms.register_repair_checksum_range([&db] (sstring keyspace, sstring cf, query::range<dht::token> range, rpc::optional<repair_checksum> hash_version) {
+                ms.register_repair_checksum_range([&db] (sstring keyspace, sstring cf, nonwrapping_range<dht::token> range, rpc::optional<repair_checksum> hash_version) {
                     auto hv = hash_version ? *hash_version : repair_checksum::legacy;
                     return do_with(std::move(keyspace), std::move(cf), std::move(range),
                             [&db, hv] (auto& keyspace, auto& cf, auto& range) {
@@ -660,7 +661,14 @@ int main(int ac, char** av) {
                     return db.get_compaction_manager().stop();
                 });
             });
-        }).or_terminate();
+        }).then_wrapped([&return_value] (auto && f) {
+            try {
+                f.get();
+            } catch (...) {
+                return_value = 1;
+                engine_exit(std::current_exception());
+            }
+        });
     });
   } catch (...) {
       // reactor may not have been initialized, so can't use logger

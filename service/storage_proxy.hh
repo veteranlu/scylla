@@ -52,6 +52,12 @@
 #include "utils/estimated_histogram.hh"
 #include "tracing/trace_state.hh"
 
+namespace compat {
+
+class one_or_two_partition_ranges;
+
+}
+
 namespace service {
 
 class abstract_write_response_handler;
@@ -151,6 +157,7 @@ public:
         uint64_t reads = 0;
         uint64_t background_reads = 0; // client no longer waits for the read
         uint64_t read_retries = 0; // read is retried with new limit
+        uint64_t throttled_writes = 0; // total number of writes ever delayed due to throttling
 
         // Data read attempts
         split_stats data_read_attempts;
@@ -243,7 +250,7 @@ private:
     template<typename Range>
     future<> mutate_internal(Range mutations, db::consistency_level cl, tracing::trace_state_ptr tr_state);
     future<foreign_ptr<lw_shared_ptr<reconcilable_result>>> query_nonsingular_mutations_locally(
-            schema_ptr s, lw_shared_ptr<query::read_command> cmd, const query::partition_range& pr, tracing::trace_state_ptr trace_state);
+            schema_ptr s, lw_shared_ptr<query::read_command> cmd, const std::vector<query::partition_range>& pr, tracing::trace_state_ptr trace_state);
 
 public:
     storage_proxy(distributed<database>& db);
@@ -313,6 +320,16 @@ public:
     future<foreign_ptr<lw_shared_ptr<reconcilable_result>>> query_mutations_locally(
         schema_ptr, lw_shared_ptr<query::read_command> cmd, const query::partition_range&,
         tracing::trace_state_ptr trace_state = nullptr);
+
+
+    future<foreign_ptr<lw_shared_ptr<reconcilable_result>>> query_mutations_locally(
+        schema_ptr, lw_shared_ptr<query::read_command> cmd, const compat::one_or_two_partition_ranges&,
+        tracing::trace_state_ptr trace_state = nullptr);
+
+    future<foreign_ptr<lw_shared_ptr<reconcilable_result>>> query_mutations_locally(
+            schema_ptr s, lw_shared_ptr<query::read_command> cmd, const std::vector<query::partition_range>& pr,
+            tracing::trace_state_ptr trace_state = nullptr);
+
 
     future<> stop();
 

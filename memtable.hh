@@ -61,8 +61,8 @@ public:
     schema_ptr& schema() { return _schema; }
     streamed_mutation read(lw_shared_ptr<memtable> mtbl, const schema_ptr&, const query::partition_slice&);
 
-    size_t memory_usage_without_rows() const {
-        return _key.key().memory_usage();
+    size_t external_memory_usage_without_rows() const {
+        return _key.key().external_memory_usage();
     }
 
     struct compare {
@@ -101,6 +101,7 @@ public:
         bi::member_hook<memtable_entry, bi::set_member_hook<>, &memtable_entry::_link>,
         bi::compare<memtable_entry::compare>>;
 private:
+    memtable_list *_memtable_list;
     schema_ptr _schema;
     logalloc::allocating_section _read_section;
     logalloc::allocating_section _allocating_section;
@@ -116,7 +117,9 @@ private:
     partition_entry& find_or_create_partition_slow(partition_key_view key);
     void upgrade_entry(memtable_entry&);
 public:
-    explicit memtable(schema_ptr schema, logalloc::region_group* dirty_memory_region_group = nullptr);
+    explicit memtable(schema_ptr schema, memtable_list *memtable_list);
+    // Used for testing that want to control the flush process.
+    explicit memtable(schema_ptr schema, logalloc::region_group *dirty_memrory_region= nullptr);
     ~memtable();
     schema_ptr schema() const { return _schema; }
     void set_schema(schema_ptr) noexcept;
@@ -134,7 +137,15 @@ public:
     const logalloc::region& region() const {
         return *this;
     }
+
+    logalloc::region_group* region_group() {
+        return group();
+    }
 public:
+    memtable_list* get_memtable_list() {
+        return _memtable_list;
+    }
+
     size_t partition_count() const;
     logalloc::occupancy_stats occupancy() const;
 
@@ -155,7 +166,6 @@ public:
     mutation_reader make_flush_reader(schema_ptr, const io_priority_class& pc);
 
     mutation_source as_data_source();
-    key_source as_key_source();
 
     bool empty() const { return partitions.empty(); }
     void mark_flushed(lw_shared_ptr<sstables::sstable> sst);

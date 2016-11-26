@@ -39,6 +39,7 @@
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "partition_range_compat.hh"
 #include "db/consistency_level.hh"
 #include "db/commitlog/commitlog.hh"
 #include "storage_proxy.hh"
@@ -230,6 +231,7 @@ public:
              if (_proxy->need_throttle_writes()) {
                  _throttled = true;
                  _proxy->_throttled_writes.push_back(_id);
+                 ++_proxy->_stats.throttled_writes;
              } else {
                  unthrottle();
              }
@@ -467,6 +469,16 @@ storage_proxy::storage_proxy(distributed<database>& db) : _db(db) {
                 , scollectd::per_cpu_plugin_instance
                 , "queue_length", "background writes")
                 , scollectd::make_typed(scollectd::data_type::GAUGE, _stats.background_writes)
+        ),
+        scollectd::add_polled_metric(scollectd::type_instance_id("storage_proxy"
+                , scollectd::per_cpu_plugin_instance
+                , "queue_length", "throttled writes")
+                , scollectd::make_typed(scollectd::data_type::GAUGE, [this] { return _throttled_writes.size(); })
+        ),
+        scollectd::add_polled_metric(scollectd::type_instance_id("storage_proxy"
+                , scollectd::per_cpu_plugin_instance
+                , "total_operations", "throttled writes")
+                , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.throttled_writes)
         ),
         scollectd::add_polled_metric(scollectd::type_instance_id("storage_proxy"
                 , scollectd::per_cpu_plugin_instance
@@ -1098,7 +1110,7 @@ future<> storage_proxy::mutate_begin(std::vector<unique_response_handler> ids, d
 // future returned by mutate_begin()). The future should be ready when function is called.
 future<> storage_proxy::mutate_end(future<> mutate_result, utils::latency_counter lc, tracing::trace_state_ptr trace_state) {
     assert(mutate_result.available());
-    _stats.write.mark(lc.stop().latency_in_nano());
+    _stats.write.mark(lc.stop().latency());
     if (lc.is_start()) {
         _stats.estimated_write.add(lc.latency(), _stats.write.hist.count);
     }
@@ -2139,15 +2151,17 @@ protected:
             });
         }
     }
-    future<foreign_ptr<lw_shared_ptr<query::result>>> make_data_request(gms::inet_address ep, clock_type::time_point timeout) {
+    future<foreign_ptr<lw_shared_ptr<query::result>>> make_data_request(gms::inet_address ep, clock_type::time_point timeout, bool want_digest) {
         ++_proxy->_stats.data_read_attempts.get_ep_stat(ep);
         if (is_me(ep)) {
             tracing::trace(_trace_state, "read_data: querying locally");
-            return _proxy->query_singular_local(_schema, _cmd, _partition_range, query::result_request::result_and_digest, _trace_state);
+            auto qrr = want_digest ? query::result_request::result_and_digest : query::result_request::only_result;
+            return _proxy->query_singular_local(_schema, _cmd, _partition_range, qrr, _trace_state);
         } else {
             auto& ms = net::get_local_messaging_service();
             tracing::trace(_trace_state, "read_data: sending a message to /{}", ep);
-            return ms.send_read_data(net::messaging_service::msg_addr{ep, 0}, timeout, *_cmd, _partition_range).then([this, ep](query::result&& result) {
+            auto da = want_digest ? query::digest_algorithm::MD5 : query::digest_algorithm::none;
+            return ms.send_read_data(net::messaging_service::msg_addr{ep, 0}, timeout, *_cmd, _partition_range, da).then([this, ep](query::result&& result) {
                 tracing::trace(_trace_state, "read_data: got response from /{}", ep);
                 return make_foreign(::make_lw_shared<query::result>(std::move(result)));
             });
@@ -2180,9 +2194,9 @@ protected:
             });
         });
     }
-    future<> make_data_requests(digest_resolver_ptr resolver, targets_iterator begin, targets_iterator end, clock_type::time_point timeout) {
-        return parallel_for_each(begin, end, [this, resolver = std::move(resolver), timeout] (gms::inet_address ep) {
-            return make_data_request(ep, timeout).then_wrapped([this, resolver, ep] (future<foreign_ptr<lw_shared_ptr<query::result>>> f) {
+    future<> make_data_requests(digest_resolver_ptr resolver, targets_iterator begin, targets_iterator end, clock_type::time_point timeout, bool want_digest) {
+        return parallel_for_each(begin, end, [this, resolver = std::move(resolver), timeout, want_digest] (gms::inet_address ep) {
+            return make_data_request(ep, timeout, want_digest).then_wrapped([this, resolver, ep] (future<foreign_ptr<lw_shared_ptr<query::result>>> f) {
                 try {
                     resolver->add_data(ep, f.get0());
                     ++_proxy->_stats.data_read_completed.get_ep_stat(ep);
@@ -2209,7 +2223,8 @@ protected:
     }
     virtual future<> make_requests(digest_resolver_ptr resolver, clock_type::time_point timeout) {
         resolver->add_wait_targets(_targets.size());
-        return when_all(make_data_requests(resolver, _targets.begin(), _targets.begin() + 1, timeout),
+        auto want_digest = _targets.size() > 1;
+        return when_all(make_data_requests(resolver, _targets.begin(), _targets.begin() + 1, timeout, want_digest),
                         make_digest_requests(resolver, _targets.begin() + 1, _targets.end(), timeout)).discard_result();
     }
     virtual void got_cl() {}
@@ -2356,7 +2371,9 @@ public:
     using abstract_read_executor::abstract_read_executor;
     virtual future<> make_requests(digest_resolver_ptr resolver, std::chrono::steady_clock::time_point timeout) {
         resolver->add_wait_targets(_targets.size());
-        return when_all(make_data_requests(resolver, _targets.begin(), _targets.begin() + 2, timeout),
+        // FIXME: consider disabling for CL=*ONE
+        bool want_digest = true;
+        return when_all(make_data_requests(resolver, _targets.begin(), _targets.begin() + 2, timeout, want_digest),
                         make_digest_requests(resolver, _targets.begin() + 2, _targets.end(), timeout)).discard_result();
     }
 };
@@ -2370,9 +2387,11 @@ public:
         _speculate_timer.set_callback([this, resolver, timeout] {
             if (!resolver->is_completed()) { // at the time the callback runs request may be completed already
                 resolver->add_wait_targets(1); // we send one more request so wait for it too
+                // FIXME: consider disabling for CL=*ONE
+                bool want_digest = true;
                 future<> f = resolver->has_data() ?
                         make_digest_requests(resolver, _targets.end() - 1, _targets.end(), timeout) :
-                        make_data_requests(resolver, _targets.end() - 1, _targets.end(), timeout);
+                        make_data_requests(resolver, _targets.end() - 1, _targets.end(), timeout, want_digest);
                 f.finally([exec = shared_from_this()]{});
             }
         });
@@ -2386,16 +2405,18 @@ public:
         // if CL + RR result in covering all replicas, getReadExecutor forces AlwaysSpeculating.  So we know
         // that the last replica in our list is "extra."
         resolver->add_wait_targets(_targets.size() - 1);
+        // FIXME: consider disabling for CL=*ONE
+        bool want_digest = true;
         if (_block_for < _targets.size() - 1) {
             // We're hitting additional targets for read repair.  Since our "extra" replica is the least-
             // preferred by the snitch, we do an extra data read to start with against a replica more
             // likely to reply; better to let RR fail than the entire query.
-            return when_all(make_data_requests(resolver, _targets.begin(), _targets.begin() + 2, timeout),
+            return when_all(make_data_requests(resolver, _targets.begin(), _targets.begin() + 2, timeout, want_digest),
                             make_digest_requests(resolver, _targets.begin() + 2, _targets.end(), timeout)).discard_result();
         } else {
             // not doing read repair; all replies are important, so it doesn't matter which nodes we
             // perform data reads against vs digest.
-            return when_all(make_data_requests(resolver, _targets.begin(), _targets.begin() + 1, timeout),
+            return when_all(make_data_requests(resolver, _targets.begin(), _targets.begin() + 1, timeout, want_digest),
                             make_digest_requests(resolver, _targets.begin() + 1, _targets.end() - 1, timeout)).discard_result();
         }
     }
@@ -2454,7 +2475,8 @@ db::read_repair_decision storage_proxy::new_read_repair_decision(const schema& s
     size_t block_for = db::block_for(ks, cl);
     auto p = shared_from_this();
     // Speculative retry is disabled *OR* there are simply no extra replicas to speculate.
-    if (retry_type == speculative_retry::type::NONE || db::block_for(ks, cl) == all_replicas.size()) {
+    if (retry_type == speculative_retry::type::NONE || block_for == all_replicas.size()
+            || (repair_decision == db::read_repair_decision::DC_LOCAL && is_datacenter_local(cl) && block_for == target_replicas.size())) {
         return ::make_shared<never_speculating_read_executor>(schema, p, cmd, std::move(pr), cl, block_for, std::move(target_replicas), std::move(trace_state));
     }
 
@@ -2466,18 +2488,28 @@ db::read_repair_decision storage_proxy::new_read_repair_decision(const schema& s
     }
 
     // RRD.NONE or RRD.DC_LOCAL w/ multiple DCs.
-    gms::inet_address extra_replica = all_replicas[target_replicas.size()];
-    // With repair decision DC_LOCAL all replicas/target replicas may be in different order, so
-    // we might have to find a replacement that's not already in targetReplicas.
-    if (repair_decision == db::read_repair_decision::DC_LOCAL && boost::range::find(target_replicas, extra_replica) != target_replicas.end()) {
-        auto it = boost::range::find_if(all_replicas, [&target_replicas] (gms::inet_address& a){
-            return boost::range::find(target_replicas, a) == target_replicas.end();
-        });
-        extra_replica = *it;
+    if (target_replicas.size() == block_for) { // If RRD.DC_LOCAL extra replica may already be present
+        auto good_replica = [&target_replicas, local_only = is_datacenter_local(cl)] (gms::inet_address ep) {
+            if (local_only && !db::is_local(ep)) {
+                return false;
+            } else {
+                return boost::range::find(target_replicas, ep) == target_replicas.end();
+            }
+        };
+        gms::inet_address extra_replica = all_replicas[target_replicas.size()];
+        // With repair decision DC_LOCAL all replicas/target replicas may be in different order, so
+        // we might have to find a replacement that's not already in targetReplicas.
+        if (!good_replica(extra_replica)) {
+            auto it = boost::range::find_if(all_replicas, std::move(good_replica));
+            if (it == all_replicas.end()) {
+                logger.trace("read executor no extra target to speculate");
+                return ::make_shared<never_speculating_read_executor>(schema, p, cmd, std::move(pr), cl, block_for, std::move(target_replicas), std::move(trace_state));
+            }
+            extra_replica = *it;
+        }
+        target_replicas.push_back(extra_replica);
+        logger.trace("creating read executor with extra target {}", extra_replica);
     }
-    target_replicas.push_back(extra_replica);
-
-    logger.trace("creating read executor with extra target {}", extra_replica);
 
     if (retry_type == speculative_retry::type::ALWAYS) {
         return ::make_shared<always_speculating_read_executor>(schema, p, cmd, std::move(pr), cl, block_for, std::move(target_replicas), std::move(trace_state));
@@ -2496,8 +2528,8 @@ storage_proxy::query_singular_local_digest(schema_ptr s, lw_shared_ptr<query::re
 future<foreign_ptr<lw_shared_ptr<query::result>>>
 storage_proxy::query_singular_local(schema_ptr s, lw_shared_ptr<query::read_command> cmd, const query::partition_range& pr, query::result_request request, tracing::trace_state_ptr trace_state) {
     unsigned shard = _db.local().shard_of(pr.start()->value().token());
-    return _db.invoke_on(shard, [gs = global_schema_ptr(s), prv = std::vector<query::partition_range>({pr}) /* FIXME: pr is copied */, cmd, request, trace_state = std::move(trace_state)] (database& db) mutable {
-        return db.query(gs, *cmd, request, prv, std::move(trace_state)).then([](auto&& f) {
+    return _db.invoke_on(shard, [gs = global_schema_ptr(s), prv = std::vector<query::partition_range>({pr}) /* FIXME: pr is copied */, cmd, request, gt = tracing::global_trace_state_ptr(std::move(trace_state))] (database& db) mutable {
+        return db.query(gs, *cmd, request, prv, gt).then([](auto&& f) {
             return make_foreign(std::move(f));
         });
     });
@@ -2643,12 +2675,19 @@ storage_proxy::query_partition_key_range(lw_shared_ptr<query::read_command> cmd,
         }
     }
 
+    // estimate_result_rows_per_range() is currently broken, and this is not needed
+    // when paging is available in any case
+#if 0
     // our estimate of how many result rows there will be per-range
     float result_rows_per_range = estimate_result_rows_per_range(cmd, ks);
     // underestimate how many rows we will get per-range in order to increase the likelihood that we'll
     // fetch enough rows in the first round
     result_rows_per_range -= result_rows_per_range * CONCURRENT_SUBREQUESTS_MARGIN;
     int concurrency_factor = result_rows_per_range == 0.0 ? 1 : std::max(1, std::min(int(ranges.size()), int(std::ceil(cmd->row_limit / result_rows_per_range))));
+#else
+    int result_rows_per_range = 0;
+    int concurrency_factor = 1;
+#endif
 
     std::vector<foreign_ptr<lw_shared_ptr<query::result>>> results;
     results.reserve(ranges.size()/concurrency_factor + 1);
@@ -2716,19 +2755,19 @@ storage_proxy::do_query(schema_ptr s,
     if (query::is_single_partition(partition_ranges[0])) { // do not support mixed partitions (yet?)
         try {
             return query_singular(cmd, std::move(partition_ranges), cl, std::move(trace_state)).finally([lc, p] () mutable {
-                    p->_stats.read.mark(lc.stop().latency_in_nano());
+                    p->_stats.read.mark(lc.stop().latency());
                     if (lc.is_start()) {
                         p->_stats.estimated_read.add(lc.latency(), p->_stats.read.hist.count);
                     }
             });
         } catch (const no_such_column_family&) {
-            _stats.read.mark(lc.stop().latency_in_nano());
+            _stats.read.mark(lc.stop().latency());
             return make_empty();
         }
     }
 
     return query_partition_key_range(cmd, std::move(partition_ranges), cl, std::move(trace_state)).finally([lc, p] () mutable {
-        p->_stats.read.mark(lc.stop().latency_in_nano());
+        p->_stats.read.mark(lc.stop().latency());
     });
 }
 
@@ -2905,7 +2944,7 @@ get_restricted_ranges(locator::token_metadata& tm, const schema& s, query::parti
     dht::ring_position_comparator cmp(s);
 
     // special case for bounds containing exactly 1 token
-    if (start_token(range) == end_token(range) && !range.is_wrap_around(cmp)) {
+    if (start_token(range) == end_token(range)) {
         if (start_token(range).is_minimum()) {
             return {};
         }
@@ -2915,13 +2954,7 @@ get_restricted_ranges(locator::token_metadata& tm, const schema& s, query::parti
     std::vector<query::partition_range> ranges;
 
     auto add_range = [&ranges, &cmp] (query::partition_range&& r) {
-        if (r.is_wrap_around(cmp)) {
-            auto unwrapped = r.unwrap();
-            ranges.emplace_back(std::move(unwrapped.second)); // Append in split order
-            ranges.emplace_back(std::move(unwrapped.first));
-        } else {
-            ranges.emplace_back(std::move(r));
-        }
+        ranges.emplace_back(std::move(r));
     };
 
     // divide the queryRange into pieces delimited by the ring
@@ -3269,7 +3302,7 @@ void storage_proxy::init_messaging_service() {
             return net::messaging_service::no_wait();
         });
     });
-    ms.register_read_data([] (const rpc::client_info& cinfo, query::read_command cmd, query::partition_range pr) {
+    ms.register_read_data([] (const rpc::client_info& cinfo, query::read_command cmd, compat::wrapping_partition_range pr, rpc::optional<query::digest_algorithm> oda) {
         tracing::trace_state_ptr trace_state_ptr;
         auto src_addr = net::messaging_service::get_source(cinfo);
         if (cmd.trace_info) {
@@ -3277,17 +3310,31 @@ void storage_proxy::init_messaging_service() {
             tracing::begin(trace_state_ptr);
             tracing::trace(trace_state_ptr, "read_data: message received from /{}", src_addr.addr);
         }
-
-        return do_with(std::move(pr), get_local_shared_storage_proxy(), std::move(trace_state_ptr), [&cinfo, cmd = make_lw_shared<query::read_command>(std::move(cmd)), src_addr = std::move(src_addr)] (const query::partition_range& pr, shared_ptr<storage_proxy>& p, tracing::trace_state_ptr& trace_state_ptr) mutable {
+        auto da = oda.value_or(query::digest_algorithm::MD5);
+        return do_with(std::move(pr), get_local_shared_storage_proxy(), std::move(trace_state_ptr), [&cinfo, cmd = make_lw_shared<query::read_command>(std::move(cmd)), src_addr = std::move(src_addr), da] (compat::wrapping_partition_range& pr, shared_ptr<storage_proxy>& p, tracing::trace_state_ptr& trace_state_ptr) mutable {
             auto src_ip = src_addr.addr;
-            return get_schema_for_read(cmd->schema_version, std::move(src_addr)).then([cmd, &pr, &p, &trace_state_ptr] (schema_ptr s) {
-                return p->query_singular_local(std::move(s), cmd, pr, query::result_request::result_and_digest, trace_state_ptr);
+            return get_schema_for_read(cmd->schema_version, std::move(src_addr)).then([cmd, da, &pr, &p, &trace_state_ptr] (schema_ptr s) {
+                auto pr2 = compat::unwrap(std::move(pr), *s);
+                if (pr2.second) {
+                    // this function assumes singular queries but doesn't validate
+                    throw std::runtime_error("READ_DATA called with wrapping range");
+                }
+                query::result_request qrr;
+                switch (da) {
+                case query::digest_algorithm::none:
+                    qrr = query::result_request::only_result;
+                    break;
+                case query::digest_algorithm::MD5:
+                    qrr = query::result_request::result_and_digest;
+                    break;
+                }
+                return p->query_singular_local(std::move(s), cmd, std::move(pr2.first), qrr, trace_state_ptr);
             }).finally([&trace_state_ptr, src_ip] () mutable {
                 tracing::trace(trace_state_ptr, "read_data handling is done, sending a response to /{}", src_ip);
             });
         });
     });
-    ms.register_read_mutation_data([] (const rpc::client_info& cinfo, query::read_command cmd, query::partition_range pr) {
+    ms.register_read_mutation_data([] (const rpc::client_info& cinfo, query::read_command cmd, compat::wrapping_partition_range pr) {
         tracing::trace_state_ptr trace_state_ptr;
         auto src_addr = net::messaging_service::get_source(cinfo);
         if (cmd.trace_info) {
@@ -3295,16 +3342,16 @@ void storage_proxy::init_messaging_service() {
             tracing::begin(trace_state_ptr);
             tracing::trace(trace_state_ptr, "read_mutation_data: message received from /{}", src_addr.addr);
         }
-        return do_with(std::move(pr), get_local_shared_storage_proxy(), std::move(trace_state_ptr), [&cinfo, cmd = make_lw_shared<query::read_command>(std::move(cmd)), src_addr = std::move(src_addr)] (const query::partition_range& pr, shared_ptr<storage_proxy>& p, tracing::trace_state_ptr& trace_state_ptr) mutable {
+        return do_with(std::move(pr), get_local_shared_storage_proxy(), std::move(trace_state_ptr), [&cinfo, cmd = make_lw_shared<query::read_command>(std::move(cmd)), src_addr = std::move(src_addr)] (compat::wrapping_partition_range& pr, shared_ptr<storage_proxy>& p, tracing::trace_state_ptr& trace_state_ptr) mutable {
             auto src_ip = src_addr.addr;
-            return get_schema_for_read(cmd->schema_version, std::move(src_addr)).then([cmd, &pr, &p, &trace_state_ptr] (schema_ptr s) {
-                return p->query_mutations_locally(std::move(s), cmd, pr, trace_state_ptr);
+            return get_schema_for_read(cmd->schema_version, std::move(src_addr)).then([cmd, &pr, &p, &trace_state_ptr] (schema_ptr s) mutable {
+                return p->query_mutations_locally(std::move(s), cmd, compat::unwrap(std::move(pr), *s), trace_state_ptr);
             }).finally([&trace_state_ptr, src_ip] () mutable {
                 tracing::trace(trace_state_ptr, "read_mutation_data handling is done, sending a response to /{}", src_ip);
             });
         });
     });
-    ms.register_read_digest([] (const rpc::client_info& cinfo, query::read_command cmd, query::partition_range pr) {
+    ms.register_read_digest([] (const rpc::client_info& cinfo, query::read_command cmd, compat::wrapping_partition_range pr) {
         tracing::trace_state_ptr trace_state_ptr;
         auto src_addr = net::messaging_service::get_source(cinfo);
         if (cmd.trace_info) {
@@ -3312,10 +3359,15 @@ void storage_proxy::init_messaging_service() {
             tracing::begin(trace_state_ptr);
             tracing::trace(trace_state_ptr, "read_digest: message received from /{}", src_addr.addr);
         }
-        return do_with(std::move(pr), get_local_shared_storage_proxy(), std::move(trace_state_ptr), [&cinfo, cmd = make_lw_shared<query::read_command>(std::move(cmd)), src_addr = std::move(src_addr)] (const query::partition_range& pr, shared_ptr<storage_proxy>& p, tracing::trace_state_ptr& trace_state_ptr) mutable {
+        return do_with(std::move(pr), get_local_shared_storage_proxy(), std::move(trace_state_ptr), [&cinfo, cmd = make_lw_shared<query::read_command>(std::move(cmd)), src_addr = std::move(src_addr)] (compat::wrapping_partition_range& pr, shared_ptr<storage_proxy>& p, tracing::trace_state_ptr& trace_state_ptr) mutable {
             auto src_ip = src_addr.addr;
             return get_schema_for_read(cmd->schema_version, std::move(src_addr)).then([cmd, &pr, &p, &trace_state_ptr] (schema_ptr s) {
-                return p->query_singular_local_digest(std::move(s), cmd, pr, trace_state_ptr);
+                auto pr2 = compat::unwrap(std::move(pr), *s);
+                if (pr2.second) {
+                    // this function assumes singular queries but doesn't validate
+                    throw std::runtime_error("READ_DIGEST called with wrapping range");
+                }
+                return p->query_singular_local_digest(std::move(s), cmd, std::move(pr2.first), trace_state_ptr);
             }).finally([&trace_state_ptr, src_ip] () mutable {
                 tracing::trace(trace_state_ptr, "read_digest handling is done, sending a response to /{}", src_ip);
             });
@@ -3351,103 +3403,26 @@ void storage_proxy::uninit_messaging_service() {
 // Merges reconcilable_result:s from different shards into one
 // Drops partitions which exceed the limit.
 class mutation_result_merger {
-    // Adapts reconcilable_result to a consumable sequence of partitions.
-    struct partition_run {
-        foreign_ptr<lw_shared_ptr<reconcilable_result>> result;
-        // we order by (priority, partition_key) to preserve ordering in wraparound
-        // queries.
-        unsigned priority;
-        size_t index = 0;
-
-        partition_run(std::pair<foreign_ptr<lw_shared_ptr<reconcilable_result>>, unsigned> result)
-            : result(std::move(result.first)), priority(result.second)
-        { }
-
-        const partition& current() const {
-            return result->partitions()[index];
-        }
-
-        bool has_more() const {
-            return index < result->partitions().size();
-        }
-
-        void advance() {
-            ++index;
-        }
-    };
-
-    lw_shared_ptr<query::read_command> _cmd;
-    schema_ptr _schema;
-    std::vector<partition_run> _runs;
+    unsigned _row_count = 0;
+    unsigned _partition_count = 0;
+    std::vector<partition> _partitions;
 public:
-    mutation_result_merger(lw_shared_ptr<query::read_command> cmd, schema_ptr schema)
-        : _cmd(std::move(cmd))
-        , _schema(std::move(schema))
-    { }
-
-    void reserve(size_t shard_count) {
-        _runs.reserve(shard_count);
-    }
-
-    future<> operator()(std::pair<foreign_ptr<lw_shared_ptr<reconcilable_result>>, unsigned> result) {
-        if (result.first->partitions().size() > 0) {
-            _runs.emplace_back(partition_run(std::move(result)));
+    void add_result(foreign_ptr<lw_shared_ptr<reconcilable_result>> partial_result) {
+        // Following three lines to simplify patch; can remove later
+        for (const partition& p : partial_result->partitions()) {
+            _partitions.push_back(p);
+            _row_count += p._row_count;
+            _partition_count += p._row_count > 0;
         }
-        return make_ready_future<>();
     }
-
-    future<reconcilable_result> get() {
-        auto cmp = [this] (const partition_run& r1, const partition_run& r2) {
-            if (r1.priority < r2.priority) {
-                return false;
-            } else if (r1.priority > r2.priority) {
-                return true;
-            }
-            const partition& p1 = r1.current();
-            const partition& p2 = r2.current();
-            return p1._m.key(*_schema).ring_order_tri_compare(*_schema, p2._m.key(*_schema)) > 0;
-        };
-
-        if (_runs.empty()) {
-            return make_ready_future<reconcilable_result>(reconcilable_result(0, std::vector<partition>()));
-        }
-
-        boost::range::make_heap(_runs, cmp);
-
-        return repeat_until_value([this, cmp = std::move(cmp), partitions = std::vector<partition>(), row_count = 0u, partition_count = 0u] () mutable {
-            std::experimental::optional<reconcilable_result> ret;
-
-            boost::range::pop_heap(_runs, cmp);
-            partition_run& next = _runs.back();
-            const partition& p = next.current();
-            unsigned limit_left = _cmd->row_limit - row_count;
-            if (p._row_count > limit_left) {
-                // no space for all rows in the mutation
-                // unfreeze -> trim -> freeze
-                mutation m = p.mut().unfreeze(_schema);
-                static const std::vector<query::clustering_range> all(1, query::clustering_range::make_open_ended_both_sides());
-                bool is_reversed = _cmd->slice.options.contains(query::partition_slice::option::reversed);
-                auto rc = m.partition().compact_for_query(*_schema, _cmd->timestamp, all, is_reversed, limit_left);
-                partitions.push_back(partition(rc, freeze(m)));
-                row_count += rc;
-            } else {
-                partitions.push_back(p);
-                row_count += p._row_count;
-            }
-            partition_count += p._row_count > 0;
-            if (row_count < _cmd->row_limit) {
-                next.advance();
-                if (next.has_more()) {
-                    boost::range::push_heap(_runs, cmp);
-                } else {
-                    _runs.pop_back();
-                }
-            }
-            if (_runs.empty() || row_count >= _cmd->row_limit || partition_count >= _cmd->partition_limit) {
-                ret = reconcilable_result(row_count, std::move(partitions));
-            }
-            return make_ready_future<std::experimental::optional<reconcilable_result>>(std::move(ret));
-        });
+    reconcilable_result get() && {
+        return reconcilable_result(_row_count, std::move(_partitions));
+    }
+    unsigned partition_count() const {
+        return _partition_count;
+    }
+    unsigned row_count() const {
+        return _row_count;
     }
 };
 
@@ -3455,11 +3430,20 @@ future<foreign_ptr<lw_shared_ptr<reconcilable_result>>>
 storage_proxy::query_mutations_locally(schema_ptr s, lw_shared_ptr<query::read_command> cmd, const query::partition_range& pr, tracing::trace_state_ptr trace_state) {
     if (pr.is_singular()) {
         unsigned shard = _db.local().shard_of(pr.start()->value().token());
-        return _db.invoke_on(shard, [cmd, &pr, gs = global_schema_ptr(s), trace_state = std::move(trace_state)] (database& db) mutable {
-            return db.query_mutations(gs, *cmd, pr, std::move(trace_state)).then([] (reconcilable_result&& result) {
+        return _db.invoke_on(shard, [cmd, &pr, gs=global_schema_ptr(s), gt = tracing::global_trace_state_ptr(std::move(trace_state))] (database& db) mutable {
+            return db.query_mutations(gs, *cmd, pr, gt).then([] (reconcilable_result&& result) {
                 return make_foreign(make_lw_shared(std::move(result)));
             });
         });
+    } else {
+        return query_nonsingular_mutations_locally(std::move(s), std::move(cmd), {pr}, std::move(trace_state));
+    }
+}
+
+future<foreign_ptr<lw_shared_ptr<reconcilable_result>>>
+storage_proxy::query_mutations_locally(schema_ptr s, lw_shared_ptr<query::read_command> cmd, const compat::one_or_two_partition_ranges& pr, tracing::trace_state_ptr trace_state) {
+    if (!pr.second) {
+        return query_mutations_locally(std::move(s), std::move(cmd), pr.first, std::move(trace_state));
     } else {
         return query_nonsingular_mutations_locally(std::move(s), std::move(cmd), pr, std::move(trace_state));
     }
@@ -3467,38 +3451,42 @@ storage_proxy::query_mutations_locally(schema_ptr s, lw_shared_ptr<query::read_c
 
 
 future<foreign_ptr<lw_shared_ptr<reconcilable_result>>>
-storage_proxy::query_nonsingular_mutations_locally(schema_ptr s, lw_shared_ptr<query::read_command> cmd, const query::partition_range& pr, tracing::trace_state_ptr trace_state) {
-    struct part {
-        query::partition_range pr;
-        unsigned shard;
-        unsigned priority;
-    };
-    std::vector<part> parts;
-    auto shard_nonwrapped_partition_range = [&] (const query::partition_range& pr, unsigned priority) {
-        for (auto shard : smp::all_cpus()) {
-            parts.push_back(part{pr, shard, priority});
-        }
-    };
-    if (pr.is_wrap_around(dht::ring_position_comparator(*s))) {
-        parts.reserve(smp::count * 2);
-        auto unw = pr.unwrap();
-        shard_nonwrapped_partition_range(unw.first, 0);
-        shard_nonwrapped_partition_range(unw.second, 1);
-    } else {
-        parts.reserve(smp::count);
-        shard_nonwrapped_partition_range(pr, 0);
-    }
-    return do_with(std::move(parts), [this, s, cmd, trace_state] (std::vector<part>& parts) mutable {
-        auto query_part = [this, cmd, gs=global_schema_ptr(s), gt = tracing::global_trace_state_ptr(std::move(trace_state))] (part p) mutable {
-            return _db.invoke_on(p.shard, [cmd, gs, gt, p] (database& db) mutable {
-                return db.query_mutations(gs, *cmd, p.pr, gt).then([priority = p.priority] (reconcilable_result&& result) {
-                    return std::make_pair(make_foreign(make_lw_shared(std::move(result))), priority);
+storage_proxy::query_nonsingular_mutations_locally(schema_ptr s, lw_shared_ptr<query::read_command> cmd, const std::vector<query::partition_range>& prs, tracing::trace_state_ptr trace_state) {
+    // no one permitted us to modify *cmd, so make a copy
+    auto shard_cmd = make_lw_shared<query::read_command>(*cmd);
+    return do_with(cmd,
+            shard_cmd,
+            mutation_result_merger{},
+            dht::ring_position_range_vector_sharder{prs},
+            global_schema_ptr(s),
+            tracing::global_trace_state_ptr(std::move(trace_state)),
+            [this, s] (lw_shared_ptr<query::read_command>& cmd,
+                    lw_shared_ptr<query::read_command>& shard_cmd,
+                    mutation_result_merger& mrm,
+                    dht::ring_position_range_vector_sharder& rprs,
+                    global_schema_ptr& gs,
+                    tracing::global_trace_state_ptr& gt) {
+        return repeat_until_value([&, s] () -> future<stdx::optional<reconcilable_result>> {
+            auto now = rprs.next(*s);
+            if (!now) {
+                return make_ready_future<stdx::optional<reconcilable_result>>(std::move(mrm).get());
+            }
+            shard_cmd->partition_limit = cmd->partition_limit - mrm.partition_count();
+            shard_cmd->row_limit = cmd->row_limit - mrm.row_count();
+            return _db.invoke_on(now->shard, [&, now = std::move(*now), gt] (database& db) {
+                return db.query_mutations(gs, *shard_cmd, now.ring_range, std::move(gt)).then([] (reconcilable_result&& rr) {
+                    return make_foreign(make_lw_shared(std::move(rr)));
                 });
+            }).then([&] (foreign_ptr<lw_shared_ptr<reconcilable_result>> rr) -> stdx::optional<reconcilable_result> {
+                mrm.add_result(std::move(rr));
+                if (mrm.partition_count() >= cmd->partition_limit || mrm.row_count() >= cmd->row_limit) {
+                    return std::move(mrm).get();
+                }
+                return stdx::nullopt;
             });
-        };
-        return map_reduce(parts.begin(), parts.end(), query_part, mutation_result_merger{ cmd, s }).then([] (reconcilable_result&& result) {
-            return make_foreign(make_lw_shared(std::move(result)));
         });
+    }).then([] (reconcilable_result&& result) {
+        return make_foreign(make_lw_shared(std::move(result)));
     });
 }
 

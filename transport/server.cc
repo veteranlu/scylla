@@ -976,7 +976,7 @@ cql_server::connection::process_batch(uint16_t stream, bytes_view buf, service::
     tracing::set_optional_serial_consistency_level(client_state.get_trace_state(), options.get_serial_consistency());
     tracing::trace(client_state.get_trace_state(), "Creating a batch statement");
 
-    auto batch = ::make_shared<cql3::statements::batch_statement>(-1, cql3::statements::batch_statement::type(type), std::move(modifications), cql3::attributes::none());
+    auto batch = ::make_shared<cql3::statements::batch_statement>(-1, cql3::statements::batch_statement::type(type), std::move(modifications), cql3::attributes::none(), _server._query_processor.local().get_cql_stats());
     return _server._query_processor.local().process_batch(batch, query_state, options).then([this, stream, batch] (auto msg) {
         return this->make_result(stream, msg);
     }).then([&query_state, q_state = std::move(q_state), this] (auto&& response) {
@@ -1504,7 +1504,11 @@ std::vector<char> cql_server::response::compress_lz4(const std::vector<char>& bo
     output[1] = (input_len >> 16) & 0xFF;
     output[2] = (input_len >> 8) & 0xFF;
     output[3] = input_len & 0xFF;
+#ifdef HAVE_LZ4_COMPRESS_DEFAULT
+    auto ret = LZ4_compress_default(input, output + 4, input_len, LZ4_compressBound(input_len));
+#else
     auto ret = LZ4_compress(input, output + 4, input_len);
+#endif
     if (ret == 0) {
         throw std::runtime_error("CQL frame LZ4 compression failure");
     }

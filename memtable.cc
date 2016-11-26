@@ -26,8 +26,16 @@
 
 namespace stdx = std::experimental;
 
-memtable::memtable(schema_ptr schema, logalloc::region_group* dirty_memory_region_group)
+memtable::memtable(schema_ptr schema, memtable_list* memtable_list)
+        : logalloc::region(memtable_list ? logalloc::region(memtable_list->region_group()) : logalloc::region())
+        , _memtable_list(memtable_list)
+        , _schema(std::move(schema))
+        , partitions(memtable_entry::compare(_schema)) {
+}
+
+memtable::memtable(schema_ptr schema, logalloc::region_group *dirty_memory_region_group)
         : logalloc::region(dirty_memory_region_group ? logalloc::region(*dirty_memory_region_group) : logalloc::region())
+        , _memtable_list(nullptr)
         , _schema(std::move(schema))
         , partitions(memtable_entry::compare(_schema)) {
 }
@@ -107,7 +115,7 @@ memtable::slice(const query::partition_range& range) const {
 class iterator_reader: public mutation_reader::impl {
     lw_shared_ptr<memtable> _memtable;
     schema_ptr _schema;
-    const query::partition_range& _range;
+    const query::partition_range* _range;
     stdx::optional<dht::decorated_key> _last;
     memtable::partitions_type::iterator _i;
     memtable::partitions_type::iterator _end;
@@ -116,10 +124,10 @@ class iterator_reader: public mutation_reader::impl {
 
     memtable::partitions_type::iterator lookup_end() {
         auto cmp = memtable_entry::compare(_memtable->_schema);
-        return _range.end()
-            ? (_range.end()->is_inclusive()
-                ? _memtable->partitions.upper_bound(_range.end()->value(), cmp)
-                : _memtable->partitions.lower_bound(_range.end()->value(), cmp))
+        return _range->end()
+            ? (_range->end()->is_inclusive()
+                ? _memtable->partitions.upper_bound(_range->end()->value(), cmp)
+                : _memtable->partitions.lower_bound(_range->end()->value(), cmp))
             : _memtable->partitions.end();
     }
     void update_iterators() {
@@ -135,10 +143,10 @@ class iterator_reader: public mutation_reader::impl {
             }
         } else {
             // Initial lookup
-            _i = _range.start()
-                 ? (_range.start()->is_inclusive()
-                    ? _memtable->partitions.lower_bound(_range.start()->value(), cmp)
-                    : _memtable->partitions.upper_bound(_range.start()->value(), cmp))
+            _i = _range->start()
+                 ? (_range->start()->is_inclusive()
+                    ? _memtable->partitions.lower_bound(_range->start()->value(), cmp)
+                    : _memtable->partitions.upper_bound(_range->start()->value(), cmp))
                  : _memtable->partitions.begin();
             _end = lookup_end();
             _last_partition_count = _memtable->partition_count();
@@ -151,7 +159,7 @@ protected:
                     const query::partition_range& range)
         : _memtable(std::move(m))
         , _schema(std::move(s))
-        , _range(range)
+        , _range(&range)
     { }
 
     memtable_entry* fetch_next_entry() {
@@ -186,7 +194,7 @@ protected:
     std::experimental::optional<query::partition_range> get_delegate_range() {
         // We cannot run concurrently with row_cache::update().
         if (_memtable->is_flushed()) {
-            return _last ? _range.split_after(*_last, dht::ring_position_comparator(*_memtable->_schema)) : _range;
+            return _last ? _range->split_after(*_last, dht::ring_position_comparator(*_memtable->_schema)) : *_range;
         }
         return {};
     }
@@ -199,6 +207,12 @@ protected:
         _memtable = {};
         _last = {};
         return ret;
+    }
+public:
+    virtual future<> fast_forward_to(const query::partition_range& pr) override {
+        _range = &pr;
+        _last = { };
+        return make_ready_future<>();
     }
 };
 
@@ -248,7 +262,7 @@ class flush_memory_accounter {
 public:
     void update_bytes_read(uint64_t delta) {
         _bytes_read += delta;
-        dirty_memory_manager::from_region_group(_region.group()).account_potentially_cleaned_up_memory(delta);
+        dirty_memory_manager::from_region_group(_region.group()).account_potentially_cleaned_up_memory(&_region, delta);
     }
 
     explicit flush_memory_accounter(logalloc::region& region)
@@ -257,11 +271,11 @@ public:
 
     ~flush_memory_accounter() {
         assert(_bytes_read <= _region.occupancy().used_space());
-        dirty_memory_manager::from_region_group(_region.group()).revert_potentially_cleaned_up_memory(_bytes_read);
+        dirty_memory_manager::from_region_group(_region.group()).revert_potentially_cleaned_up_memory(&_region, _bytes_read);
     }
     void account_component(memtable_entry& e) {
         auto delta = _region.allocator().object_memory_size_in_allocator(&e)
-                     + e.memory_usage_without_rows();
+                     + e.external_memory_usage_without_rows();
         update_bytes_read(delta);
     }
     void account_component(partition_snapshot& snp) {
@@ -281,11 +295,11 @@ public:
     // allocation. As long as our size read here is lesser or equal to the size in the memtables, we
     // are safe, and worst case we will allow a bit fewer requests in.
     void operator()(const range_tombstone& rt) {
-        _accounter.update_bytes_read(sizeof(range_tombstone) + rt.memory_usage());
+        _accounter.update_bytes_read(rt.memory_usage());
     }
 
     void operator()(const static_row& sr) {
-        _accounter.update_bytes_read(sr.memory_usage());
+        _accounter.update_bytes_read(sr.external_memory_usage());
     }
 
     void operator()(const clustering_row& cr) {
@@ -295,7 +309,7 @@ public:
         // and we don't know which one(s) contributed to the generation of this mutation fragment.
         //
         // We will add the size of the struct here, and that should be good enough.
-        _accounter.update_bytes_read(sizeof(rows_entry) + cr.memory_usage());
+        _accounter.update_bytes_read(sizeof(rows_entry) + cr.external_memory_usage());
     }
 };
 
@@ -333,10 +347,6 @@ memtable::make_reader(schema_ptr s,
                       const query::partition_range& range,
                       const query::partition_slice& slice,
                       const io_priority_class& pc) {
-    if (query::is_wrap_around(range, *s)) {
-        fail(unimplemented::cause::WRAP_AROUND);
-    }
-
     if (query::is_single_partition(range)) {
         const query::ring_position& pos = range.start()->value();
         return _read_section(*this, [&] {
@@ -413,12 +423,6 @@ logalloc::occupancy_stats memtable::occupancy() const {
 mutation_source memtable::as_data_source() {
     return mutation_source([mt = shared_from_this()] (schema_ptr s, const query::partition_range& range) {
         return mt->make_reader(std::move(s), range);
-    });
-}
-
-key_source memtable::as_key_source() {
-    return key_source([mt = shared_from_this()] (const query::partition_range& range) {
-        return make_key_from_mutation_reader(mt->make_reader(mt->_schema, range));
     });
 }
 

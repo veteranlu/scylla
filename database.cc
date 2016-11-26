@@ -39,6 +39,7 @@
 #include <boost/algorithm/string/split.hpp>
 #include "sstables/sstables.hh"
 #include "sstables/compaction.hh"
+#include "sstables/remove.hh"
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/range/adaptor/map.hpp>
 #include "locator/simple_snitch.hh"
@@ -97,28 +98,28 @@ lw_shared_ptr<memtable_list>
 column_family::make_memory_only_memtable_list() {
     auto seal = [this] (memtable_list::flush_behavior ignored) { return make_ready_future<>(); };
     auto get_schema = [this] { return schema(); };
-    return make_lw_shared<memtable_list>(std::move(seal), std::move(get_schema), _config.max_memtable_size, _config.dirty_memory_manager);
+    return make_lw_shared<memtable_list>(std::move(seal), std::move(get_schema), _config.dirty_memory_manager);
 }
 
 lw_shared_ptr<memtable_list>
 column_family::make_memtable_list() {
     auto seal = [this] (memtable_list::flush_behavior behavior) { return seal_active_memtable(behavior); };
     auto get_schema = [this] { return schema(); };
-    return make_lw_shared<memtable_list>(std::move(seal), std::move(get_schema), _config.max_memtable_size, _config.dirty_memory_manager);
+    return make_lw_shared<memtable_list>(std::move(seal), std::move(get_schema), _config.dirty_memory_manager);
 }
 
 lw_shared_ptr<memtable_list>
 column_family::make_streaming_memtable_list() {
     auto seal = [this] (memtable_list::flush_behavior behavior) { return seal_active_streaming_memtable(behavior); };
     auto get_schema =  [this] { return schema(); };
-    return make_lw_shared<memtable_list>(std::move(seal), std::move(get_schema), _config.max_streaming_memtable_size, _config.streaming_dirty_memory_manager);
+    return make_lw_shared<memtable_list>(std::move(seal), std::move(get_schema), _config.streaming_dirty_memory_manager);
 }
 
 lw_shared_ptr<memtable_list>
 column_family::make_streaming_memtable_big_list(streaming_memtable_big& smb) {
     auto seal = [this, &smb] (memtable_list::flush_behavior) { return seal_active_streaming_memtable_big(smb); };
     auto get_schema =  [this] { return schema(); };
-    return make_lw_shared<memtable_list>(std::move(seal), std::move(get_schema), _config.max_streaming_memtable_size, _config.streaming_dirty_memory_manager);
+    return make_lw_shared<memtable_list>(std::move(seal), std::move(get_schema), _config.streaming_dirty_memory_manager);
 }
 
 column_family::column_family(schema_ptr schema, config config, db::commitlog* cl, compaction_manager& compaction_manager)
@@ -128,7 +129,7 @@ column_family::column_family(schema_ptr schema, config config, db::commitlog* cl
     , _streaming_memtables(_config.enable_disk_writes ? make_streaming_memtable_list() : make_memory_only_memtable_list())
     , _compaction_strategy(make_compaction_strategy(_schema->compaction_strategy(), _schema->compaction_strategy_options()))
     , _sstables(make_lw_shared(_compaction_strategy.make_sstable_set(_schema)))
-    , _cache(_schema, sstables_as_mutation_source(), sstables_as_key_source(), global_cache_tracker(), _config.max_cached_partition_size_in_bytes)
+    , _cache(_schema, sstables_as_mutation_source(), global_cache_tracker(), _config.max_cached_partition_size_in_bytes)
     , _commitlog(cl)
     , _compaction_manager(compaction_manager)
     , _flush_queue(std::make_unique<memtable_flush_queue>())
@@ -320,14 +321,53 @@ filter_sstable_for_reader(std::vector<sstables::shared_sstable>&& sstables, colu
     return sstables;
 }
 
-class range_sstable_reader final : public mutation_reader::impl {
-    const query::partition_range& _pr;
+class range_sstable_reader final : public combined_mutation_reader {
+    schema_ptr _s;
+    const query::partition_range* _pr;
     lw_shared_ptr<sstables::sstable_set> _sstables;
-    mutation_reader _reader;
+
+    struct sstable_and_reader {
+        sstables::shared_sstable _sstable;
+        // This indirection is sad, but we need stable pointers to mutation
+        // readers. If this ever becomes a performance issue we could store
+        // mutation readers in an object pool (we don't need to preserve order
+        // and can have holes left in the container when elements are removed).
+        std::unique_ptr<mutation_reader> _reader;
+
+        bool operator<(const sstable_and_reader& other) const {
+            return _sstable < other._sstable;
+        }
+
+        struct less_compare {
+            bool operator()(const sstable_and_reader& a, const sstable_and_reader& b) {
+                return a < b;
+            }
+            bool operator()(const sstable_and_reader& a, const sstables::shared_sstable& b) {
+                return a._sstable < b;
+            }
+            bool operator()(const sstables::shared_sstable& a, const sstable_and_reader& b) {
+                return a < b._sstable;
+            }
+        };
+    };
+    std::vector<sstable_and_reader> _current_readers;
+
     // Use a pointer instead of copying, so we don't need to regenerate the reader if
     // the priority changes.
     const io_priority_class& _pc;
     tracing::trace_state_ptr _trace_state;
+    const query::partition_slice& _slice;
+private:
+    std::unique_ptr<mutation_reader> create_reader(sstables::shared_sstable sst) {
+        tracing::trace(_trace_state, "Reading partition range {} from sstable {}", *_pr, seastar::value_of([&sst] { return sst->get_filename(); }));
+        // FIXME: make sstable::read_range_rows() return ::mutation_reader so that we can drop this wrapper.
+        mutation_reader reader =
+            make_mutation_reader<sstable_range_wrapping_reader>(sst, _s, *_pr, _slice, _pc);
+        if (sst->is_shared()) {
+            reader = make_filtering_reader(std::move(reader), belongs_to_current_shard);
+        }
+        return std::make_unique<mutation_reader>(std::move(reader));
+    }
 public:
     range_sstable_reader(schema_ptr s,
                          lw_shared_ptr<sstables::sstable_set> sstables,
@@ -335,29 +375,64 @@ public:
                          const query::partition_slice& slice,
                          const io_priority_class& pc,
                          tracing::trace_state_ptr trace_state)
-        : _pr(pr)
+        : _s(s)
+        , _pr(&pr)
         , _sstables(std::move(sstables))
         , _pc(pc)
         , _trace_state(std::move(trace_state))
+        , _slice(slice)
     {
-        std::vector<mutation_reader> readers;
-        for (const lw_shared_ptr<sstables::sstable>& sst : _sstables->select(pr)) {
-            tracing::trace(_trace_state, "Reading partition range {} from sstable {}", _pr, seastar::value_of([&sst] { return sst->get_filename(); }));
-            // FIXME: make sstable::read_range_rows() return ::mutation_reader so that we can drop this wrapper.
-            mutation_reader reader =
-                make_mutation_reader<sstable_range_wrapping_reader>(sst, s, pr, slice, _pc);
-            if (sst->is_shared()) {
-                reader = make_filtering_reader(std::move(reader), belongs_to_current_shard);
-            }
-            readers.emplace_back(std::move(reader));
+        auto ssts = _sstables->select(pr);
+        std::vector<mutation_reader*> readers;
+        readers.reserve(ssts.size());
+        _current_readers.reserve(ssts.size());
+        for (auto& sst : ssts) {
+            auto reader = create_reader(sst);
+            readers.emplace_back(reader.get());
+            _current_readers.emplace_back(sstable_and_reader { sst, std::move(reader) });
         }
-        _reader = make_combined_reader(std::move(readers));
+        init_mutation_reader_set(std::move(readers));
     }
 
     range_sstable_reader(range_sstable_reader&&) = delete; // reader takes reference to member fields
 
-    virtual future<streamed_mutation_opt> operator()() override {
-        return _reader();
+    virtual future<> fast_forward_to(const query::partition_range& pr) override {
+        _pr = &pr;
+
+        auto new_sstables = _sstables->select(pr);
+        boost::range::sort(new_sstables);
+        boost::range::sort(_current_readers);
+
+        std::vector<sstables::shared_sstable> to_add;
+        std::vector<sstable_and_reader> to_remove, unchanged;
+        sstable_and_reader::less_compare cmp;
+        boost::set_difference(new_sstables, _current_readers, std::back_inserter(to_add), cmp);
+        std::set_difference(_current_readers.begin(), _current_readers.end(), new_sstables.begin(), new_sstables.end(),
+                            boost::back_move_inserter(to_remove), cmp);
+        std::set_intersection(_current_readers.begin(), _current_readers.end(), new_sstables.begin(), new_sstables.end(),
+                              boost::back_move_inserter(unchanged), cmp);
+
+        std::vector<sstable_and_reader> to_add_sar;
+        boost::transform(to_add, std::back_inserter(to_add_sar), [&] (const sstables::shared_sstable& sst) {
+            return sstable_and_reader { sst, create_reader(sst) };
+        });
+
+        auto get_mutation_readers = [] (std::vector<sstable_and_reader>& ssts) {
+            std::vector<mutation_reader*> mrs;
+            mrs.reserve(ssts.size());
+            boost::range::transform(ssts, std::back_inserter(mrs), [] (const sstable_and_reader& s_a_r) {
+                return s_a_r._reader.get();
+            });
+            return mrs;
+        };
+
+        auto to_add_mrs = get_mutation_readers(to_add_sar);
+        auto to_remove_mrs = get_mutation_readers(to_remove);
+
+        unchanged.insert(unchanged.end(), std::make_move_iterator(to_add_sar.begin()), std::make_move_iterator(to_add_sar.end()));
+        return combined_mutation_reader::fast_forward_to(std::move(to_add_mrs), std::move(to_remove_mrs), pr).then([this, new_readers = std::move(unchanged)] () mutable {
+            _current_readers = std::move(new_readers);
+        });
     }
 };
 
@@ -453,23 +528,6 @@ column_family::make_sstable_reader(schema_ptr s,
     }
 }
 
-key_source column_family::sstables_as_key_source() const {
-    return key_source([this] (const query::partition_range& range, const io_priority_class& pc) {
-        std::vector<key_reader> readers;
-        readers.reserve(_sstables->all()->size());
-        std::transform(_sstables->all()->begin(), _sstables->all()->end(), std::back_inserter(readers), [&] (auto&& sst) {
-            auto rd = sstables::make_key_reader(_schema, sst, range, pc);
-            if (sst->is_shared()) {
-                rd = make_filtering_reader(std::move(rd), [] (const dht::decorated_key& dk) {
-                    return dht::shard_of(dk.token()) == engine().cpu_id();
-                });
-            }
-            return rd;
-        });
-        return make_combined_reader(_schema, std::move(readers));
-    });
-}
-
 // Exposed for testing, not performance critical.
 future<column_family::const_mutation_partition_ptr>
 column_family::find_partition(schema_ptr s, const dht::decorated_key& key) const {
@@ -514,11 +572,6 @@ column_family::make_reader(schema_ptr s,
                            const query::partition_slice& slice,
                            const io_priority_class& pc,
                            tracing::trace_state_ptr trace_state) const {
-    if (query::is_wrap_around(range, *s)) {
-        // make_combined_reader() can't handle streams that wrap around yet.
-        fail(unimplemented::cause::WRAP_AROUND);
-    }
-
     std::vector<mutation_reader> readers;
     readers.reserve(_memtables->size() + 1);
 
@@ -560,10 +613,6 @@ column_family::make_streaming_reader(schema_ptr s,
                            const query::partition_range& range) const {
     auto& slice = query::full_slice;
     auto& pc = service::get_local_streaming_read_priority();
-    if (query::is_wrap_around(range, *s)) {
-        // make_combined_reader() can't handle streams that wrap around yet.
-        fail(unimplemented::cause::WRAP_AROUND);
-    }
 
     std::vector<mutation_reader> readers;
     readers.reserve(_memtables->size() + 1);
@@ -687,56 +736,30 @@ private:
 
 
 future<> lister::scan_dir(sstring name, lister::dir_entry_types type, walker_type walker, filter_type filter) {
-    return open_checked_directory(general_disk_error, name).then([type, walker = std::move(walker), filter = std::move(filter), name] (file f) {
+    return open_checked_directory(general_disk_error_handler, name).then([type, walker = std::move(walker), filter = std::move(filter), name] (file f) {
             auto l = make_lw_shared<lister>(std::move(f), type, walker, filter, name);
             return l->done().then([l] { });
     });
 }
 
-static bool belongs_to_current_shard(const schema& s, const partition_key& first, const partition_key& last) {
-    auto key_shard = [&s] (const partition_key& pk) {
-        auto token = dht::global_partitioner().get_token(s, pk);
-        return dht::shard_of(token);
-    };
-    auto s1 = key_shard(first);
-    auto s2 = key_shard(last);
-    auto me = engine().cpu_id();
-    return (s1 <= me) && (me <= s2);
+static bool belongs_to_current_shard(const std::vector<shard_id>& shards) {
+    return boost::find(shards, engine().cpu_id()) != shards.end();
 }
 
-static bool belongs_to_other_shard(const schema& s, const partition_key& first, const partition_key& last) {
-    auto key_shard = [&s] (const partition_key& pk) {
-        auto token = dht::global_partitioner().get_token(s, pk);
-        return dht::shard_of(token);
-    };
-    auto s1 = key_shard(first);
-    auto s2 = key_shard(last);
-    auto me = engine().cpu_id();
-    return (s1 != me) || (me != s2);
-}
-
-static bool belongs_to_current_shard(const schema& s, range<partition_key> r) {
-    assert(r.start());
-    assert(r.end());
-    return belongs_to_current_shard(s, r.start()->value(), r.end()->value());
-}
-
-static bool belongs_to_other_shard(const schema& s, range<partition_key> r) {
-    assert(r.start());
-    assert(r.end());
-    return belongs_to_other_shard(s, r.start()->value(), r.end()->value());
+static bool belongs_to_other_shard(const std::vector<shard_id>& shards) {
+    return shards.size() != size_t(belongs_to_current_shard(shards));
 }
 
 future<> column_family::load_sstable(sstables::sstable&& sstab, bool reset_level) {
     auto sst = make_lw_shared<sstables::sstable>(std::move(sstab));
-    return sst->get_sstable_key_range(*_schema).then([this, sst, reset_level] (range<partition_key> r) mutable {
+    return sst->get_owning_shards_from_unloaded().then([this, sst, reset_level] (std::vector<shard_id> shards) mutable {
         // Checks whether or not sstable belongs to current shard.
-        if (!belongs_to_current_shard(*_schema, r)) {
+        if (!belongs_to_current_shard(shards)) {
             dblog.debug("sstable {} not relevant for this shard, ignoring", sst->get_filename());
             sst->mark_for_deletion();
             return make_ready_future<>();
         }
-        bool in_other_shard = belongs_to_other_shard(*_schema, std::move(r));
+        bool in_other_shard = belongs_to_other_shard(shards);
         return sst->load().then([this, sst, in_other_shard, reset_level] () mutable {
             if (in_other_shard) {
                 // If we're here, this sstable is shared by this and other
@@ -855,10 +878,6 @@ column_family::seal_active_streaming_memtable_delayed() {
         return make_ready_future<>();
     }
 
-    if (_streaming_memtables->should_flush()) {
-        return seal_active_streaming_memtable_immediate();
-    }
-
     if (!_delayed_streaming_flush.armed()) {
             // We don't want to wait for too long, because the incoming mutations will not be available
             // until we flush them to SSTables. On top of that, if the sender ran out of messages, it won't
@@ -889,8 +908,7 @@ column_family::seal_active_streaming_memtable_immediate() {
         auto current_waiters = std::exchange(_waiting_streaming_flushes, shared_promise<>());
         auto f = current_waiters.get_shared_future(); // for this seal
 
-        _config.streaming_dirty_memory_manager->serialize_flush([this, old] {
-          return with_lock(_sstables_lock.for_read(), [this, old] {
+        with_lock(_sstables_lock.for_read(), [this, old] {
             auto newtab = make_lw_shared<sstables::sstable>(_schema,
                 _config.datadir, calculate_generation_for_new_table(),
                 sstables::sstable::version_types::ka,
@@ -923,7 +941,6 @@ column_family::seal_active_streaming_memtable_immediate() {
             });
             // We will also not have any retry logic. If we fail here, we'll fail the streaming and let
             // the upper layers know. They can then apply any logic they want here.
-          });
         }).then_wrapped([this, current_waiters = std::move(current_waiters)] (future <> f) mutable {
             if (f.failed()) {
                 current_waiters.set_exception(f.get_exception());
@@ -987,12 +1004,10 @@ column_family::seal_active_memtable(memtable_list::flush_behavior ignored) {
       _config.cf_stats->pending_memtables_flushes_count++;
       _config.cf_stats->pending_memtables_flushes_bytes += memtable_size;
 
-      return _config.dirty_memory_manager->serialize_flush([this, old] {
-        return repeat([this, old] {
-            return with_lock(_sstables_lock.for_read(), [this, old] {
-                _flush_queue->check_open_gate();
-                return try_flush_memtable_to_sstable(old);
-            });
+      return repeat([this, old] {
+        return with_lock(_sstables_lock.for_read(), [this, old] {
+            _flush_queue->check_open_gate();
+            return try_flush_memtable_to_sstable(old);
         });
       }).then([this, memtable_size] {
         _config.cf_stats->pending_memtables_flushes_count--;
@@ -1034,6 +1049,24 @@ column_family::try_flush_memtable_to_sstable(lw_shared_ptr<memtable> old) {
         return newtab->open_data();
     }).then_wrapped([this, old, newtab] (future<> ret) {
         dblog.debug("Flushing to {} done", newtab->get_filename());
+        // Could pass the iterator to the seal functions, and avoid the need to search the
+        // unordered_map here. But this is supposed to be cheap and it is a lot less clutter in the
+        // method signatures. Also makes it optional and streaming memtables don't have to do it.
+        // Note that the number of entries in this hash is limited by the background flushes
+        // semaphore, so it'll always be small.
+        //
+        // In terms of releasing dirty memory, this is almost as far as we should go. We could do
+        // this right before updating the cache, but from this point on to update_cache we have no
+        // deferring points, so that's fine. We do it in here because if we fail this write it will
+        // try the write again and that will create a new flush reader that will decrease dirty
+        // memory again. So we need to get rid of the charges here anyway for correctness.
+        //
+        // After the cache starts to be updated the region in transferred over. We kind of assume
+        // there will be no deferring point between this and update cache transferring ownership.
+        // It's not that bad if it is so we wouldn't really protect against it, but without a
+        // deferring point we can guarantee that no request will see a spike in dirty memory between
+        // the release of our memory and the execution of a request.
+        dirty_memory_manager::from_region_group(old->region_group()).remove_from_flush_manager(&(old->region()));
         try {
             ret.get();
 
@@ -1074,16 +1107,22 @@ column_family::start() {
 
 future<>
 column_family::stop() {
-    _memtables->seal_active_memtable(memtable_list::flush_behavior::immediate);
-    _streaming_memtables->seal_active_memtable(memtable_list::flush_behavior::immediate);
-    return _compaction_manager.remove(this).then([this] {
-        // Nest, instead of using when_all, so we don't lose any exceptions.
-        return _flush_queue->close().then([this] {
-            return _streaming_flush_gate.close();
+    return when_all(_memtables->request_flush(), _streaming_memtables->request_flush()).discard_result().finally([this] {
+        return _compaction_manager.remove(this).then([this] {
+            // Nest, instead of using when_all, so we don't lose any exceptions.
+            return _flush_queue->close().then([this] {
+                return _streaming_flush_gate.close();
+            });
+        }).then([this] {
+            return _sstable_deletion_gate.close();
         });
-    }).then([this] {
-        return _sstable_deletion_gate.close();
     });
+}
+
+static io_error_handler error_handler_for_upload_dir() {
+    return [] (std::exception_ptr eptr) {
+        // do nothing about sstable exception and caller will just rethrow it.
+    };
 }
 
 future<std::vector<sstables::entry_descriptor>> column_family::flush_upload_dir() {
@@ -1100,9 +1139,9 @@ future<std::vector<sstables::entry_descriptor>> column_family::flush_upload_dir(
             if (comps.component != sstables::sstable::component_type::TOC) {
                 return make_ready_future<>();
             }
-            auto sst = make_lw_shared<sstables::sstable>(_schema,
-                                                        _config.datadir + "/upload", comps.generation,
-                                                        comps.version, comps.format);
+            auto sst = make_lw_shared<sstables::sstable>(_schema, _config.datadir + "/upload", comps.generation,
+                comps.version, comps.format, gc_clock::now(),
+                [] (disk_error_signal_type&) { return error_handler_for_upload_dir(); });
             work.sstables.emplace(comps.generation, std::move(sst));
             work.descriptors.emplace(comps.generation, std::move(comps));
             return make_ready_future<>();
@@ -1123,7 +1162,7 @@ future<std::vector<sstables::entry_descriptor>> column_family::flush_upload_dir(
                 }).then([this, &sst, gen] {
                     return sst->create_links(_config.datadir, gen);
                 }).then([&sst] {
-                    return sstables::remove_by_toc_name(sst->toc_filename());
+                    return sstables::remove_by_toc_name(sst->toc_filename(), error_handler_for_upload_dir());
                 });
             });
         }).then([&work] {
@@ -1247,7 +1286,17 @@ column_family::rebuild_sstable_list(const std::vector<sstables::shared_sstable>&
     // Second, delete the old sstables.  This is done in the background, so we can
     // consider this compaction completed.
     seastar::with_gate(_sstable_deletion_gate, [this, sstables_to_remove] {
-        return sstables::delete_atomically(sstables_to_remove).then([this, sstables_to_remove] {
+        return sstables::delete_atomically(sstables_to_remove).then_wrapped([this, sstables_to_remove] (future<> f) {
+            std::exception_ptr eptr;
+            try {
+                f.get();
+            } catch(...) {
+                eptr = std::current_exception();
+            }
+
+            // unconditionally remove compacted sstables from _sstables_compacted_but_not_deleted,
+            // or they could stay forever in the set, resulting in deleted files remaining
+            // opened and disk space not being released until shutdown.
             std::unordered_set<sstables::shared_sstable> s(
                    sstables_to_remove.begin(), sstables_to_remove.end());
             auto e = boost::range::remove_if(_sstables_compacted_but_not_deleted, [&] (sstables::shared_sstable sst) -> bool {
@@ -1255,6 +1304,11 @@ column_family::rebuild_sstable_list(const std::vector<sstables::shared_sstable>&
             });
             _sstables_compacted_but_not_deleted.erase(e, _sstables_compacted_but_not_deleted.end());
             rebuild_statistics();
+
+            if (eptr) {
+                return make_exception_future<>(eptr);
+            }
+            return make_ready_future<>();
         }).handle_exception([] (std::exception_ptr e) {
             try {
                 std::rethrow_exception(e);
@@ -1293,13 +1347,13 @@ column_family::compact_sstables(sstables::compaction_descriptor descriptor, bool
 }
 
 static bool needs_cleanup(const lw_shared_ptr<sstables::sstable>& sst,
-                   const lw_shared_ptr<std::vector<range<dht::token>>>& owned_ranges,
+                   const lw_shared_ptr<std::vector<nonwrapping_range<dht::token>>>& owned_ranges,
                    schema_ptr s) {
     auto first = sst->get_first_partition_key();
     auto last = sst->get_last_partition_key();
     auto first_token = dht::global_partitioner().get_token(*s, first);
     auto last_token = dht::global_partitioner().get_token(*s, last);
-    range<dht::token> sst_token_range = range<dht::token>::make(first_token, last_token);
+    nonwrapping_range<dht::token> sst_token_range = nonwrapping_range<dht::token>::make(first_token, last_token);
 
     // return true iff sst partition range isn't fully contained in any of the owned ranges.
     for (auto& r : *owned_ranges) {
@@ -1311,8 +1365,8 @@ static bool needs_cleanup(const lw_shared_ptr<sstables::sstable>& sst,
 }
 
 future<> column_family::cleanup_sstables(sstables::compaction_descriptor descriptor) {
-    std::vector<range<dht::token>> r = service::get_local_storage_service().get_local_ranges(_schema->ks_name());
-    auto owned_ranges = make_lw_shared<std::vector<range<dht::token>>>(std::move(r));
+    std::vector<nonwrapping_range<dht::token>> r = service::get_local_storage_service().get_local_ranges(_schema->ks_name());
+    auto owned_ranges = make_lw_shared<std::vector<nonwrapping_range<dht::token>>>(std::move(r));
     auto sstables_to_cleanup = make_lw_shared<std::vector<sstables::shared_sstable>>(std::move(descriptor.sstables));
 
     return parallel_for_each(*sstables_to_cleanup, [this, owned_ranges = std::move(owned_ranges), sstables_to_cleanup] (auto& sst) {
@@ -1587,7 +1641,7 @@ database::database(const db::config& cfg)
     // Note that even if we didn't allow extra memory, we would still want to keep system requests
     // in a different region group. This is because throttled requests are serviced in FIFO order,
     // and we don't want system requests to be waiting for a long time behind user requests.
-    , _system_dirty_memory_manager(*this, _memtable_total_space + (10 << 20))
+    , _system_dirty_memory_manager(*this, _memtable_total_space / 2 + (10 << 20))
     // The total space that can be used by memtables is _memtable_total_space, but we will only
     // allow the region_group to grow to half of that. This is because of virtual_dirty: memtables
     // can take a long time to flush, and if we are using the maximum amount of memory possible,
@@ -1666,28 +1720,28 @@ database::setup_collectd() {
     _collectd.push_back(
         scollectd::add_polled_metric(scollectd::type_instance_id("database"
                 , scollectd::per_cpu_plugin_instance
-                , "total_operations", "clustering_filter")
+                , "total_operations", "clustering_filter_count")
                 , scollectd::make_typed(scollectd::data_type::DERIVE, _cf_stats.clustering_filter_count)
     ));
 
     _collectd.push_back(
         scollectd::add_polled_metric(scollectd::type_instance_id("database"
                 , scollectd::per_cpu_plugin_instance
-                , "total_operations", "clustering_filter")
+                , "total_operations", "clustering_filter_sstables_checked")
                 , scollectd::make_typed(scollectd::data_type::DERIVE, _cf_stats.sstables_checked_by_clustering_filter)
     ));
 
     _collectd.push_back(
         scollectd::add_polled_metric(scollectd::type_instance_id("database"
                 , scollectd::per_cpu_plugin_instance
-                , "total_operations", "clustering_filter")
+                , "total_operations", "clustering_filter_fast_path_count")
                 , scollectd::make_typed(scollectd::data_type::DERIVE, _cf_stats.clustering_filter_fast_path_count)
     ));
 
     _collectd.push_back(
         scollectd::add_polled_metric(scollectd::type_instance_id("database"
                 , scollectd::per_cpu_plugin_instance
-                , "total_operations", "clustering_filter")
+                , "total_operations", "clustering_filter_surviving_sstables")
                 , scollectd::make_typed(scollectd::data_type::DERIVE, _cf_stats.surviving_sstables_after_clustering_filter)
     ));
 
@@ -2110,8 +2164,6 @@ keyspace::make_column_family_config(const schema& s, const db::config& db_config
     cfg.enable_disk_writes = _config.enable_disk_writes;
     cfg.enable_commitlog = _config.enable_commitlog;
     cfg.enable_cache = _config.enable_cache;
-    cfg.max_memtable_size = _config.max_memtable_size;
-    cfg.max_streaming_memtable_size = _config.max_streaming_memtable_size;
     cfg.dirty_memory_manager = _config.dirty_memory_manager;
     cfg.streaming_dirty_memory_manager = _config.streaming_dirty_memory_manager;
     cfg.read_concurrency_config = _config.read_concurrency_config;
@@ -2411,7 +2463,6 @@ column_family::apply(const mutation& m, const db::replay_position& rp) {
     utils::latency_counter lc;
     _stats.writes.set_latency(lc);
     _memtables->active_memtable().apply(m, rp);
-    _memtables->seal_on_overflow();
     _stats.writes.mark(lc);
     if (lc.is_start()) {
         _stats.estimated_write.add(lc.latency(), _stats.writes.hist.count);
@@ -2424,7 +2475,6 @@ column_family::apply(const frozen_mutation& m, const schema_ptr& m_schema, const
     _stats.writes.set_latency(lc);
     check_valid_rp(rp);
     _memtables->active_memtable().apply(m, m_schema, rp);
-    _memtables->seal_on_overflow();
     _stats.writes.mark(lc);
     if (lc.is_start()) {
         _stats.estimated_write.add(lc.latency(), _stats.writes.hist.count);
@@ -2437,7 +2487,6 @@ void column_family::apply_streaming_mutation(schema_ptr m_schema, utils::UUID pl
         return;
     }
     _streaming_memtables->active_memtable().apply(m, m_schema);
-    _streaming_memtables->seal_on_overflow();
 }
 
 void column_family::apply_streaming_big_mutation(schema_ptr m_schema, utils::UUID plan_id, const frozen_mutation& m) {
@@ -2448,7 +2497,6 @@ void column_family::apply_streaming_big_mutation(schema_ptr m_schema, utils::UUI
     }
     auto entry = it->second;
     entry->memtables->active_memtable().apply(m, m_schema);
-    entry->memtables->seal_on_overflow();
 }
 
 void
@@ -2460,51 +2508,113 @@ column_family::check_valid_rp(const db::replay_position& rp) const {
 
 future<> dirty_memory_manager::shutdown() {
     _db_shutdown_requested = true;
-    return _waiting_flush_gate.close().then([this] {
+    _should_flush.signal();
+    return std::move(_waiting_flush).then([this] {
         return _region_group.shutdown();
     });
 }
 
-void dirty_memory_manager::maybe_do_active_flush() {
-    if (!_db || !under_pressure() || _db_shutdown_requested) {
-        return;
+future<> memtable_list::request_flush() {
+    if (!_flush_coalescing) {
+        _flush_coalescing = shared_promise<>();
+        return _dirty_memory_manager->get_flush_permit().then([this] (auto permit) {
+            auto current_flush = std::move(*_flush_coalescing);
+            _flush_coalescing = {};
+            return _dirty_memory_manager->flush_one(*this, std::move(permit)).then_wrapped([this, current_flush = std::move(current_flush)] (auto f) mutable {
+                if (f.failed()) {
+                    current_flush.set_exception(f.get_exception());
+                } else {
+                    current_flush.set_value();
+                }
+            });
+        });
+    } else {
+        return _flush_coalescing->get_shared_future();
     }
-
-    // Flush already ongoing. We don't need to initiate an active flush at this moment.
-    if (_flush_serializer.current() == 0) {
-        return;
-    }
-
-    // There are many criteria that can be used to select what is the best memtable to
-    // flush. Most of the time we want some coordination with the commitlog to allow us to
-    // release commitlog segments as early as we can.
-    //
-    // But during pressure condition, we'll just pick the CF that holds the largest
-    // memtable. The advantage of doing this is that this is objectively the one that will
-    // release the biggest amount of memory and is less likely to be generating tiny
-    // SSTables. The disadvantage is that right now, because we only release memory when the
-    // SSTable is fully written, that may take a bit of time to happen.
-    //
-    // However, since we'll very soon have a mechanism in place to account for the memory
-    // that was already written in one form or another, that disadvantage is mitigated.
-    memtable& biggest_memtable = memtable::from_region(*_region_group.get_largest_region());
-    auto& biggest_cf = _db->find_column_family(biggest_memtable.schema());
-    memtable_list& mtlist = get_memtable_list(biggest_cf);
-    // Please note that this will eventually take the semaphore and prevent two concurrent flushes.
-    // We don't need any other extra protection.
-    mtlist.seal_active_memtable(memtable_list::flush_behavior::immediate);
 }
 
-memtable_list& memtable_dirty_memory_manager::get_memtable_list(column_family& cf) {
-    return *(cf._memtables);
+future<> dirty_memory_manager::flush_one(memtable_list& mtlist, semaphore_units<> permit) {
+    if (mtlist.back()->empty()) {
+        return make_ready_future<>();
+    }
+
+    auto* region = &(mtlist.back()->region());
+    auto* region_group = mtlist.back()->region_group();
+    auto schema = mtlist.back()->schema();
+    // Because the region groups are hierarchical, when we pick the biggest region creating pressure
+    // (in the memory-driven flush case) we may be picking a memtable that is placed in a region
+    // group below ours. That's totally fine and we can certainly use our semaphore to account for
+    // it, but we need to destroy the semaphore units from the right flush manager.
+    //
+    // If we abandon size-driven flush and go with another flushing scheme that always guarantees
+    // that we're picking from this region_group, we can simplify this.
+    dirty_memory_manager::from_region_group(region_group).add_to_flush_manager(region, std::move(permit));
+    auto fut = mtlist.seal_active_memtable(memtable_list::flush_behavior::immediate);
+    return get_units(_background_work_flush_serializer, 1).then([this, fut = std::move(fut), region, region_group, schema] (auto permit) mutable {
+        return std::move(fut).then_wrapped([this, region, region_group, schema, permit = std::move(permit)] (auto f) {
+            // There are two cases in which we may still need to remove the permits from here.
+            //
+            // 1) Some exception happenend, and we can't know at which point. It could be that because
+            //    of that, the permits are still dangling. We have to remove it.
+            // 2) If we are using a memory-only Column Family. That will never create a memtable
+            //    flush object, and we'll never get rid of the permits. So we have to remove it
+            //    here.
+            dirty_memory_manager::from_region_group(region_group).remove_from_flush_manager(region);
+            if (f.failed()) {
+                dblog.error("Failed to flush memtable, {}:{}", schema->ks_name(), schema->cf_name());
+            }
+            return std::move(f);
+        });
+    });
 }
 
-memtable_list& streaming_dirty_memory_manager::get_memtable_list(column_family& cf) {
-    return *(cf._streaming_memtables);
+future<> dirty_memory_manager::flush_when_needed() {
+    if (!_db) {
+        return make_ready_future<>();
+    }
+    // If there are explicit flushes requested, we must wait for them to finish before we stop.
+    return do_until([this] { return _db_shutdown_requested; }, [this] {
+        auto has_work = [this] { return over_soft_limit() || _db_shutdown_requested; };
+        return _should_flush.wait(std::move(has_work)).then([this] {
+            return get_flush_permit().then([this] (auto permit) {
+                // We give priority to explicit flushes. They are mainly user-initiated flushes,
+                // flushes coming from a DROP statement, or commitlog flushes.
+                if (_flush_serializer.waiters()) {
+                    return make_ready_future<>();
+                }
+                // condition abated while we waited for the semaphore
+                if (!this->over_soft_limit() || _db_shutdown_requested) {
+                    return make_ready_future<>();
+                }
+                // There are many criteria that can be used to select what is the best memtable to
+                // flush. Most of the time we want some coordination with the commitlog to allow us to
+                // release commitlog segments as early as we can.
+                //
+                // But during pressure condition, we'll just pick the CF that holds the largest
+                // memtable. The advantage of doing this is that this is objectively the one that will
+                // release the biggest amount of memory and is less likely to be generating tiny
+                // SSTables.
+                memtable& biggest_memtable = memtable::from_region(*(this->_region_group.get_largest_region()));
+                auto mtlist = biggest_memtable.get_memtable_list();
+                // Do not wait. The semaphore will protect us against a concurrent flush. But we
+                // want to start a new one as soon as the permits are destroyed and the semaphore is
+                // made ready again, not when we are done with the current one.
+                this->flush_one(*mtlist, std::move(permit));
+                return make_ready_future<>();
+            });
+        });
+    }).finally([this] {
+        // We'll try to acquire the permit here to make sure we only really stop when there are no
+        // in-flight flushes. Our stop condition checks for the presence of waiters, but it could be
+        // that we have no waiters, but a flush still in flight. We wait for all background work to
+        // stop. When that stops, we know that the foreground work in the _flush_serializer has
+        // stopped as well.
+        return get_units(_background_work_flush_serializer, _max_background_work);
+    });
 }
 
 void dirty_memory_manager::start_reclaiming() {
-    maybe_do_active_flush();
+    _should_flush.signal();
 }
 
 future<> database::apply_in_memory(const frozen_mutation& m, schema_ptr m_schema, db::replay_position rp) {
@@ -2580,10 +2690,6 @@ database::make_keyspace_config(const keyspace_metadata& ksm) {
         cfg.enable_disk_reads = true; // we allways read from disk
         cfg.enable_commitlog = ksm.durable_writes() && _cfg->enable_commitlog() && !_cfg->enable_in_memory_data_store();
         cfg.enable_cache = _cfg->enable_cache();
-        cfg.max_memtable_size = _memtable_total_space * _cfg->memtable_cleanup_threshold();
-        // We should guarantee that at least two memtable are available, otherwise after flush, adding another memtable would
-        // easily take us into throttling until the first one is flushed.
-        cfg.max_streaming_memtable_size = std::min(cfg.max_memtable_size, _streaming_memtable_total_space / 2);
 
     } else {
         cfg.datadir = "";
@@ -2591,9 +2697,6 @@ database::make_keyspace_config(const keyspace_metadata& ksm) {
         cfg.enable_disk_reads = false;
         cfg.enable_commitlog = false;
         cfg.enable_cache = false;
-        cfg.max_memtable_size = std::numeric_limits<size_t>::max();
-        // All writes should go to the main memtable list if we're not durable
-        cfg.max_streaming_memtable_size = 0;
     }
     cfg.dirty_memory_manager = &_dirty_memory_manager;
     cfg.streaming_dirty_memory_manager = &_streaming_dirty_memory_manager;
@@ -2626,7 +2729,7 @@ std::ostream& operator<<(std::ostream& os, db::consistency_level cl) {
     case db::consistency_level::EACH_QUORUM: return os << "EACH_QUORUM";
     case db::consistency_level::SERIAL: return os << "SERIAL";
     case db::consistency_level::LOCAL_SERIAL: return os << "LOCAL_SERIAL";
-    case db::consistency_level::LOCAL_ONE: return os << "LOCAL";
+    case db::consistency_level::LOCAL_ONE: return os << "LOCAL_ONE";
     default: abort();
     }
 }
@@ -2828,7 +2931,7 @@ seal_snapshot(sstring jsondir) {
     dblog.debug("Storing manifest {}", jsonfile);
 
     return io_check(recursive_touch_directory, jsondir).then([jsonfile, json = std::move(json)] {
-        return open_checked_file_dma(general_disk_error, jsonfile, open_flags::wo | open_flags::create | open_flags::truncate).then([json](file f) {
+        return open_checked_file_dma(general_disk_error_handler, jsonfile, open_flags::wo | open_flags::create | open_flags::truncate).then([json](file f) {
             return do_with(make_file_output_stream(std::move(f)), [json] (output_stream<char>& out) {
                 return out.write(json.c_str(), json.size()).then([&out] {
                    return out.flush();
@@ -2916,7 +3019,7 @@ future<> column_family::snapshot(sstring name) {
 
 future<bool> column_family::snapshot_exists(sstring tag) {
     sstring jsondir = _config.datadir + "/snapshots/" + tag;
-    return open_checked_directory(general_disk_error, std::move(jsondir)).then_wrapped([] (future<file> f) {
+    return open_checked_directory(general_disk_error_handler, std::move(jsondir)).then_wrapped([] (future<file> f) {
         try {
             f.get0();
             return make_ready_future<bool>(true);
@@ -3040,21 +3143,17 @@ future<std::unordered_map<sstring, column_family::snapshot_details>> column_fami
 future<> column_family::flush() {
     _stats.pending_flushes++;
 
-    auto fut = _memtables->seal_active_memtable(memtable_list::flush_behavior::immediate);
-    // this rp is either:
-    // a.) Done - no-op
-    // b.) Ours
-    // c.) The last active flush not finished. If our latest memtable is
-    //     empty it still makes sense for this api call to wait for this.
-    auto high_rp = _highest_flushed_rp;
-
-    return fut.finally([this, high_rp] {
+    // highest_flushed_rp is only updated when we flush. If the memtable is currently alive, then
+    // the most up2date replay position is the one that's in there now. Otherwise, if the memtable
+    // hasn't received any writes yet, that's the one from the last flush we made.
+    auto desired_rp = _memtables->back()->empty() ? _highest_flushed_rp : _memtables->back()->replay_position();
+    return _memtables->request_flush().finally([this, desired_rp] {
         _stats.pending_flushes--;
         // In origin memtable_switch_count is incremented inside
         // ColumnFamilyMeetrics Flush.run
         _stats.memtable_switch_count++;
         // wait for all up until us.
-        return _flush_queue->wait_for_pending(high_rp);
+        return _flush_queue->wait_for_pending(desired_rp);
     });
 }
 
@@ -3071,7 +3170,7 @@ future<> column_family::flush(const db::replay_position& pos) {
     // We ignore this for now and just say that if we're asked for
     // a CF and it exists, we pretty much have to have data that needs
     // flushing. Let's do it.
-    return _memtables->seal_active_memtable(memtable_list::flush_behavior::immediate);
+    return _memtables->request_flush();
 }
 
 // FIXME: We can do much better than this in terms of cache management. Right
@@ -3112,7 +3211,7 @@ future<> column_family::flush_streaming_big_mutations(utils::UUID plan_id) {
     }
     auto entry = it->second;
     _streaming_memtables_big.erase(it);
-    return entry->memtables->seal_active_memtable(memtable_list::flush_behavior::immediate).then([entry] {
+    return entry->memtables->request_flush().then([entry] {
         return entry->flush_in_progress.close();
     }).then([this, entry] {
         return parallel_for_each(entry->sstables, [this] (auto& sst) {

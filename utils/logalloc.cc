@@ -1648,6 +1648,13 @@ void region::full_compaction() {
     _impl->full_compaction();
 }
 
+memory::reclaiming_result region::evict_some() {
+    if (_impl->is_evictable()) {
+        return _impl->evict_some();
+    }
+    return memory::reclaiming_result::reclaimed_nothing;
+}
+
 void region::make_evictable(eviction_fn fn) {
     _impl->make_evictable(std::move(fn));
 }
@@ -1706,7 +1713,7 @@ void tracker::impl::full_compaction() {
     logger.debug("Full compaction on all regions, {}", region_occupancy());
 
     for (region_impl* r : _regions) {
-        if (r->is_compactible()) {
+        if (r->reclaiming_enabled()) {
             r->full_compaction();
         }
     }

@@ -61,12 +61,32 @@ using eviction_fn = std::function<memory::reclaiming_result()>;
 class region_group_reclaimer {
 protected:
     size_t _threshold;
+    size_t _soft_limit;
     bool _under_pressure = false;
+    bool _under_soft_pressure = false;
     virtual void start_reclaiming() {}
     virtual void stop_reclaiming() {}
 public:
     bool under_pressure() const {
         return _under_pressure;
+    }
+
+    bool over_soft_limit() const {
+        return _under_soft_pressure;
+    }
+
+    void notify_soft_pressure() {
+        if (!_under_soft_pressure) {
+            _under_soft_pressure = true;
+            start_reclaiming();
+        }
+    }
+
+    void notify_soft_relief() {
+        if (_under_soft_pressure) {
+            _under_soft_pressure = false;
+            stop_reclaiming();
+        }
     }
 
     void notify_pressure() {
@@ -83,11 +103,20 @@ public:
         }
     }
 
-    region_group_reclaimer(size_t threshold = std::numeric_limits<size_t>::max()) : _threshold(threshold) {}
+    region_group_reclaimer()
+        : _threshold(std::numeric_limits<size_t>::max()), _soft_limit(std::numeric_limits<size_t>::max()) {}
+    region_group_reclaimer(size_t threshold)
+        : _threshold(threshold), _soft_limit(threshold) {}
+    region_group_reclaimer(size_t threshold, size_t soft)
+        : _threshold(threshold), _soft_limit(soft) {}
+
     virtual ~region_group_reclaimer() {}
 
     size_t throttle_threshold() const {
         return _threshold;
+    }
+    size_t soft_limit_threshold() const {
+        return _soft_limit;
     }
 };
 
@@ -231,6 +260,11 @@ public:
             // then woken up just so they can go to wait again. So let's filter that.
             if (rg->execution_permitted()) {
                 rg->release_requests();
+            }
+            if (rg->_total_memory >= rg->_reclaimer.soft_limit_threshold()) {
+                rg->_reclaimer.notify_soft_pressure();
+            } else if (rg->_total_memory < rg->_reclaimer.soft_limit_threshold()) {
+                rg->_reclaimer.notify_soft_relief();
             }
             return stop_iteration::no;
         });
@@ -455,6 +489,7 @@ public:
     reactor::idle_cpu_handler_result compact_on_idle(reactor::work_waiting_on_reactor);
 
     // Compacts as much as possible. Very expensive, mainly for testing.
+    // Guarantees that every live object from reclaimable regions will be moved.
     // Invalidates references to objects in all compactible and evictable regions.
     void full_compaction();
 
@@ -582,6 +617,9 @@ public:
     // Compacts everything. Mainly for testing.
     // Invalidates references to allocated objects.
     void full_compaction();
+
+    // Runs eviction function once. Mainly for testing.
+    memory::reclaiming_result evict_some();
 
     // Changes the reclaimability state of this region. When region is not
     // reclaimable, it won't be considered by tracker::reclaim(). By default region is

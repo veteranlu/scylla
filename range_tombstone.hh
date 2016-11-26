@@ -32,6 +32,8 @@
 namespace bi = boost::intrusive;
 namespace stdx = std::experimental;
 
+class position_in_partition_view;
+
 /**
  * Represents a ranged deletion operation. Can be empty.
  */
@@ -90,6 +92,7 @@ public:
     const bound_view end_bound() const {
         return bound_view(end, end_kind);
     }
+    position_in_partition_view position() const;
     bool empty() const {
         return !bool(tomb);
     }
@@ -144,7 +147,13 @@ public:
     // is larger than the end bound of this.
     stdx::optional<range_tombstone> apply(const schema& s, range_tombstone&& src);
 
-    size_t memory_usage() const { return start.memory_usage() + end.memory_usage(); }
+    size_t external_memory_usage() const {
+        return start.external_memory_usage() + end.external_memory_usage();
+    }
+
+    size_t memory_usage() const {
+        return sizeof(range_tombstone) + external_memory_usage();
+    }
 
     // Flips start and end bound so that range tombstone can be used in reversed
     // streams.
